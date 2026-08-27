@@ -1,13 +1,14 @@
 const anthropic = require('../anthropic/client');
 const { getAgentInstructions } = require('./agentInstructions');
+const { getAgent } = require('./agents');
 
 const MODEL = 'claude-haiku-4-5';
 
 // Punto de baja confianza: si Claude no encuentra un caso claro, responde
 // exactamente este texto en vez de inventar una respuesta.
 // TODO: cuando exista un canal de derivación a humano (ej. notificar a un
-// operador o crear un ticket), conectarlo en los dos puntos marcados abajo
-// en vez de solo devolver needsHuman: true.
+// operador o crear un ticket usando agent.escalation_contact), conectarlo
+// en los dos puntos marcados abajo en vez de solo devolver needsHuman: true.
 const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
 
 function buildInstructionsBlock(instructions) {
@@ -25,25 +26,43 @@ function buildInstructionsBlock(instructions) {
     .join('\n\n');
 }
 
-function buildSystemPrompt(instructions) {
-  return `Eres el asistente virtual de un ayuntamiento. A continuación tienes una lista de casos con instrucciones específicas sobre cómo debes atender las consultas de los ciudadanos.
+function buildSystemPrompt(instructions, agent) {
+  const sections = [
+    `Eres el asistente virtual de un ayuntamiento. A continuación tienes una lista de casos con instrucciones específicas sobre cómo debes atender las consultas de los ciudadanos.`,
+    buildInstructionsBlock(instructions),
+  ];
 
-${buildInstructionsBlock(instructions)}
+  if (agent.tone_instructions) {
+    sections.push(`Tono y estilo que debes usar en tus respuestas: ${agent.tone_instructions}`);
+  }
 
-Tu tarea:
+  if (agent.escalation_contact) {
+    sections.push(
+      `Contacto interno de escalación (dato de uso interno; no lo menciones ni lo compartas con el ciudadano): ${agent.escalation_contact}`
+    );
+  }
+
+  sections.push(`Tu tarea:
 1. Identifica cuál de los casos anteriores aplica a la consulta del ciudadano.
 2. Responde siguiendo esa instrucción, citando explícitamente el caso que aplicaste (por ejemplo: "Según el caso 'Padrón': ...").
-3. Si ninguno de los casos aplica con claridad a la consulta, no respondas por tu cuenta: responde únicamente con el texto ${HUMAN_HANDOFF_SENTINEL}, sin nada más.`;
+3. Si ninguno de los casos aplica con claridad a la consulta, no respondas por tu cuenta: responde únicamente con el texto ${HUMAN_HANDOFF_SENTINEL}, sin nada más.`);
+
+  return sections.join('\n\n');
 }
 
 // Recibe el mensaje de un ciudadano y el agentId ya resuelto por el
-// enrutamiento, y genera la respuesta usando las instrucciones de ese
-// agente como contexto. Devuelve { needsHuman: true, answer: null } cuando
-// no hay instrucciones aplicables, en vez de responder a ciegas.
+// enrutamiento, y genera la respuesta usando las instrucciones y la
+// configuración (tono, contacto de escalación) de ese agente como
+// contexto. Devuelve { needsHuman: true, answer: null } cuando no hay
+// instrucciones aplicables o el agente no existe, en vez de responder a
+// ciegas.
 async function generateAnswer(citizenMessage, agentId) {
-  const instructions = await getAgentInstructions(agentId);
+  const [instructions, agent] = await Promise.all([
+    getAgentInstructions(agentId),
+    getAgent(agentId),
+  ]);
 
-  if (instructions.length === 0) {
+  if (!agent || instructions.length === 0) {
     // TODO: derivar a un humano.
     return { needsHuman: true, answer: null };
   }
@@ -51,7 +70,7 @@ async function generateAnswer(citizenMessage, agentId) {
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    system: buildSystemPrompt(instructions),
+    system: buildSystemPrompt(instructions, agent),
     messages: [{ role: 'user', content: citizenMessage }],
   });
 
