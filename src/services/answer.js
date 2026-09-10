@@ -2,8 +2,15 @@ const anthropic = require('../anthropic/client');
 const { getAgentInstructions } = require('./agentInstructions');
 const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
+const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
+const { buscarUrl } = require('./urlTool');
 
 const MODEL = 'claude-haiku-4-5';
+
+// Margen de llamadas a la herramienta buscar_url antes de forzar una
+// respuesta final (evita bucles: página general + PDF concreto son 2 en el
+// camino feliz, se deja margen para reintentos).
+const MAX_TOOL_CALLS = 4;
 
 // Punto de baja confianza: si Claude no encuentra un caso claro, responde
 // exactamente este texto en vez de inventar una respuesta.
@@ -83,6 +90,8 @@ function buildSystemPrompt(instructions, agent, events, today) {
     buildEventsBlock(events, today),
   ];
 
+  sections.push(`Dispones de una herramienta llamada buscar_url para consultar en tiempo real páginas web y documentos PDF públicos. Solo puedes usarla sobre una URL asociada a un caso o evento marcado como "puedes leer su contenido" — para las marcadas como "solo puedes compartirla, no leer su contenido" nunca la uses, límitate a mencionar la URL tal cual. Cuando uses la herramienta sobre una página, revisa su contenido para ver si hay un documento (normalmente un PDF) relacionado específicamente con la consulta del ciudadano; si lo hay, vuelve a usar la herramienta sobre la URL exacta de ese documento (tal como aparece en el contenido que acabas de recibir, nunca inventada ni recordada de memoria) para leer su contenido antes de responder.`);
+
   if (agent.tone_instructions) {
     sections.push(`Tono y estilo que debes usar en tus respuestas: ${agent.tone_instructions}`);
   }
@@ -138,15 +147,46 @@ async function generateAnswer(citizenMessage, agentId) {
     return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
   }
 
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1024,
-    system: buildSystemPrompt(instructions, agent, events, today),
-    messages: [{ role: 'user', content: citizenMessage }],
-  });
+  const system = buildSystemPrompt(instructions, agent, events, today);
+  const hasReadableUrls =
+    instructions.some((instr) => instr.allow_url_reading) || events.some((ev) => ev.allow_url_reading);
 
-  const textBlock = response.content.find((block) => block.type === 'text');
-  const text = textBlock ? textBlock.text.trim() : '';
+  const messages = [{ role: 'user', content: citizenMessage }];
+  let toolCallCount = 0;
+  let text = '';
+
+  // Bucle de tool use: mientras Claude pida buscar_url (hasta MAX_TOOL_CALLS
+  // veces) se ejecuta de verdad y su resultado se devuelve como tool_result.
+  // Al agotar el margen se deja de ofrecer la tool, lo que fuerza una
+  // respuesta final en texto y garantiza que el bucle termina.
+  while (true) {
+    const offerTool = hasReadableUrls && toolCallCount < MAX_TOOL_CALLS;
+
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1536,
+      system,
+      messages,
+      ...(offerTool ? { tools: [BUSCAR_URL_TOOL] } : {}),
+    });
+
+    messages.push({ role: 'assistant', content: response.content });
+
+    const toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
+    if (!offerTool || toolUseBlocks.length === 0) {
+      const textBlock = response.content.find((block) => block.type === 'text');
+      text = textBlock ? textBlock.text.trim() : '';
+      break;
+    }
+
+    const toolResults = [];
+    for (const block of toolUseBlocks) {
+      toolCallCount += 1;
+      const result = await buscarUrl(block.input.url);
+      toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result.content });
+    }
+    messages.push({ role: 'user', content: toolResults });
+  }
 
   if (text === HUMAN_HANDOFF_SENTINEL) {
     // TODO: derivar a un humano.
