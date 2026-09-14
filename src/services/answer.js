@@ -3,7 +3,7 @@ const { getRelevantInstructions } = require('./agentInstructions');
 const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
 const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
-const { buscarUrl } = require('./urlTool');
+const { buscarUrlConCache } = require('./urlCache');
 const { getRecentHistory } = require('./conversationHistory');
 
 const MODEL = 'claude-haiku-4-5';
@@ -82,16 +82,25 @@ function buildEventsBlock(events, today) {
     .join('\n\n');
 }
 
-function buildSystemPrompt(instructions, agent, events, today) {
+// Parte FIJA del system prompt: todo lo que no depende de la pregunta
+// concreta del ciudadano (tono, reglas generales, estilo, tarea, eventos del
+// día, explicación de la herramienta buscar_url). Es idéntica entre todos
+// los mensajes de una misma conversación (cambia como mucho una vez al día,
+// con `today`), así que es la que lleva el cache_control: así el segundo y
+// tercer mensaje de una conversación pueden leerla de caché en vez de
+// reescribirla. Los casos generales seleccionados por búsqueda semántica
+// SÍ cambian con cada pregunta, por eso van aparte en buildInstructionsPrompt
+// y se envían sin cache_control (ver generateAnswer).
+function buildFixedSystemPrompt(agent, events, today) {
   const sections = [
     `Eres el asistente virtual de un ayuntamiento. Hoy es ${today}.`,
-    `A continuación tienes una lista de casos con instrucciones generales sobre cómo debes atender las consultas de los ciudadanos.`,
-    buildInstructionsBlock(instructions),
     `A continuación tienes eventos y avisos del calendario municipal (desde hace 60 días hasta cualquier fecha futura, sin límite). Cada evento ya trae su ESTADO calculado (EN CURSO / YA FINALIZÓ / FUTURO): confía en ese estado tal cual, no lo recalcules ni lo cuestiones. Pueden ser información puntual (una feria, una excursión) o excepciones a una instrucción general (un cierre, una avería, un cambio de horario):`,
     buildEventsBlock(events, today),
   ];
 
-  sections.push(`Dispones de una herramienta llamada buscar_url para consultar en tiempo real páginas web y documentos PDF públicos. Solo puedes usarla sobre una URL asociada a un caso o evento marcado como "puedes leer su contenido" — para las marcadas como "solo puedes compartirla, no leer su contenido" nunca la uses, límitate a mencionar la URL tal cual. Cuando uses la herramienta sobre una página, revisa su contenido para ver si hay un documento (normalmente un PDF) relacionado específicamente con la consulta del ciudadano; si lo hay, vuelve a usar la herramienta sobre la URL exacta de ese documento (tal como aparece en el contenido que acabas de recibir, nunca inventada ni recordada de memoria) para leer su contenido antes de responder.`);
+  sections.push(`Dispones de una herramienta llamada buscar_url para consultar en tiempo real páginas web y documentos PDF públicos. Solo puedes usarla sobre una URL asociada a un caso o evento marcado como "puedes leer su contenido" — para las marcadas como "solo puedes compartirla, no leer su contenido" nunca la uses, límitate a mencionar la URL tal cual. Cuando uses la herramienta sobre una página, revisa su contenido para ver si hay un documento (normalmente un PDF) relacionado específicamente con la consulta del ciudadano; si lo hay, vuelve a usar la herramienta sobre la URL exacta de ese documento (tal como aparece en el contenido que acabas de recibir, nunca inventada ni recordada de memoria) para leer su contenido antes de responder.
+
+Si el documento es un PDF con texto extraíble, recibirás ese texto directamente. Si es un PDF escaneado sin texto extraíble (por ejemplo, un documento fotografiado o impreso a mano), en su lugar recibirás sus páginas como imágenes: analízalas visualmente igual que harías con cualquier otra imagen para extraer la información que necesites, sin tratarlo como un fallo ni mencionárselo al ciudadano. Si aun así no consigues obtener información útil de un documento, no inventes su contenido bajo ningún concepto.`);
 
   if (agent.tone_instructions) {
     sections.push(`Tono y estilo que debes usar en tus respuestas: ${agent.tone_instructions}`);
@@ -115,8 +124,30 @@ Si la información disponible no permite confirmar ni descartar algo con certeza
 - Escribe como una persona del ayuntamiento contestando un chat: cercana, natural, en frases corridas, no como un informe.
 - Sé breve. Evita coletillas de cierre genéricas como "te recomendamos que consultes", "no dudes en contactar" o "cualquier duda que tengas" — si hace falta un siguiente paso, dilo de forma simple y concreta, sin relleno.`);
 
+  sections.push(`EJEMPLOS de estilo (ilustrativos: sirven para que veas el tono y el formato esperado, no son casos reales de este ayuntamiento — nunca repitas su contenido literal en una respuesta real, solo imita el tono y la forma):
+
+Ciudadano: "¿dónde puedo pagar la tasa de basuras?"
+Respuesta correcta: Puedes pagarla online en la sede electrónica del ayuntamiento, o presencialmente en la oficina de recaudación llevando el número de recibo a mano.
+
+Ciudadano: "¿está abierta la piscina municipal este fin de semana?"
+Respuesta correcta: Ahora mismo está cerrada por una avería en el sistema de filtrado, se espera que reabra la semana que viene en cuanto quede reparada.
+
+Ciudadano: "¿cuándo es el próximo pleno municipal?"
+Respuesta correcta: El próximo pleno ordinario es el tercer jueves del mes, a las 19:00 en el salón de plenos.
+
+Ciudadano: "el mercadillo semanal ¿sigue siendo los martes?"
+Respuesta correcta: Sí, el mercadillo sigue siendo los martes por la mañana, en su ubicación de siempre junto al recinto ferial.
+
+Ciudadano: "¿hay algún corte de agua previsto en mi calle esta semana?"
+Respuesta correcta (con un evento EN CURSO que menciona esa calle): Sí, hay un corte de agua programado en esa calle por una avería que se está reparando; se espera que quede resuelto en los próximos días.
+
+Ciudadano: "¿puedo montar una acampada con caravana en el parque municipal?"
+Respuesta correcta (sin caso ni evento que lo respalde con certeza): ${HUMAN_HANDOFF_SENTINEL}
+
+Fíjate en el estilo de las respuestas correctas: frases naturales y directas, sin etiquetas, sin markdown y sin coletillas de cierre genéricas — y en que la última, al no haber una base clara, no inventa nada.`);
+
   sections.push(`Tu tarea:
-1. Identifica cuál de los casos generales aplica a la consulta del ciudadano (para tu razonamiento interno, no lo escribas como etiqueta).
+1. Identifica cuál de los casos generales indicados a continuación (en el siguiente bloque) aplica a la consulta del ciudadano (para tu razonamiento interno, no lo escribas como etiqueta).
 2. Considera únicamente los eventos que mencionen explícitamente, por nombre, el mismo lugar, servicio o tema de la consulta en su título, descripción o ubicación (ver la regla estricta anterior). Ignora cualquier otro evento, aunque esté EN CURSO: no lo menciones ni lo relaciones con la respuesta.
 3. Usa el ESTADO ya calculado de cada evento relevante (EN CURSO / YA FINALIZÓ / FUTURO) tal cual te lo doy. Si el estado es YA FINALIZÓ, ese evento ya no tiene ningún efecto: aplica la instrucción general o el evento EN CURSO que corresponda como si la excepción ya finalizada nunca hubiera existido, sin matices ni dudas sobre si "podría seguir" vigente.
 4. Si un evento EN CURSO que menciona explícitamente el mismo lugar/servicio contradice o modifica una instrucción general (un cierre puntual, una avería, un cambio de horario), da prioridad a ese evento sobre la instrucción general: menciona explícitamente la excepción y no respondas solo con la información general.
@@ -125,6 +156,19 @@ Si la información disponible no permite confirmar ni descartar algo con certeza
 7. Entrega solo la conclusión final ya resuelta, con seguridad y sin hedging. No incluyas en tu respuesta el proceso de razonamiento, dudas ni autocorrecciones ("pero tengo que corregir", "revisando de nuevo"): el ciudadano solo debe ver la respuesta final, clara y directa, en el estilo indicado.`);
 
   return sections.join('\n\n');
+}
+
+// Parte DINÁMICA: los casos generales seleccionados por búsqueda semántica
+// para la pregunta concreta de este mensaje. Cambia en cada mensaje, así que
+// se envía como bloque de system aparte, SIN cache_control, después del
+// bloque fijo (ver "Render order: tools -> system -> messages" — un bloque
+// sin marcador situado después del breakpoint no invalida la caché del
+// bloque fijo que lo precede).
+function buildInstructionsPrompt(instructions) {
+  if (instructions.length === 0) {
+    return 'No se ha encontrado ningún caso general con relación suficiente con esta consulta concreta del ciudadano.';
+  }
+  return `Casos generales seleccionados como más relevantes para la consulta actual del ciudadano, con instrucciones sobre cómo atenderla:\n\n${buildInstructionsBlock(instructions)}`;
 }
 
 // Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
@@ -150,17 +194,21 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
   }
 
-  // Las instrucciones ahora son el resultado de una búsqueda semántica sobre
-  // la pregunta del ciudadano, así que ya no son idénticas entre mensajes de
-  // una misma conversación (antes sí, cuando se traían todas). El
-  // cache_control sigue teniendo valor dentro del bucle de tool use de más
-  // abajo: ese mismo system prompt puede enviarse varias veces (hasta
-  // MAX_TOOL_CALLS + 1) para un único mensaje del ciudadano.
+  // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con
+  // cache_control: idéntico entre mensajes de una misma conversación, así
+  // que a partir del segundo mensaje se lee de caché en vez de reescribirse.
+  // Bloque dinámico (casos seleccionados para esta pregunta) sin
+  // cache_control, después del breakpoint: cambia cada mensaje pero no
+  // invalida la caché del bloque fijo que lo precede.
   const system = [
     {
       type: 'text',
-      text: buildSystemPrompt(instructions, agent, events, today),
+      text: buildFixedSystemPrompt(agent, events, today),
       cache_control: { type: 'ephemeral' },
+    },
+    {
+      type: 'text',
+      text: buildInstructionsPrompt(instructions),
     },
   ];
   const hasReadableUrls =
@@ -205,7 +253,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     const toolResults = [];
     for (const block of toolUseBlocks) {
       toolCallCount += 1;
-      const result = await buscarUrl(block.input.url);
+      const result = await buscarUrlConCache(agentId, block.input.url);
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result.content });
     }
     messages.push({ role: 'user', content: toolResults });
@@ -219,4 +267,4 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   return { needsHuman: false, answer: text };
 }
 
-module.exports = { generateAnswer, buildSystemPrompt };
+module.exports = { generateAnswer, buildFixedSystemPrompt, buildInstructionsPrompt };
