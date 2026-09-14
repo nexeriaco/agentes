@@ -20,6 +20,11 @@ const BUSCAR_URL_TOOL = {
     },
     required: ['url'],
   },
+  // La definición de la tool es idéntica en cada llamada de una misma
+  // conversación (y, en la práctica, entre conversaciones del mismo
+  // agente): se cachea junto con el system prompt, que se cierra con su
+  // propio cache_control justo a continuación en la llamada a la API.
+  cache_control: { type: 'ephemeral' },
 };
 
 module.exports = { BUSCAR_URL_TOOL };

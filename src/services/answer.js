@@ -1,9 +1,10 @@
 const anthropic = require('../anthropic/client');
-const { getAgentInstructions } = require('./agentInstructions');
+const { getRelevantInstructions } = require('./agentInstructions');
 const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
 const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
 const { buscarUrl } = require('./urlTool');
+const { getRecentHistory } = require('./conversationHistory');
 
 const MODEL = 'claude-haiku-4-5';
 
@@ -54,7 +55,7 @@ function buildInstructionsBlock(instructions) {
               : 'solo puedes compartirla, no leer su contenido'
           })`
         : 'Sin URL asociada.';
-      return `Caso: ${instr.case_group}\nInstrucción: ${instr.instruction}\n${urlLine}`;
+      return `Concejalía: ${instr.case_group}\nSubtema: ${instr.case_subgroup}\nInstrucción: ${instr.instruction}\n${urlLine}`;
     })
     .join('\n\n');
 }
@@ -126,20 +127,22 @@ Si la información disponible no permite confirmar ni descartar algo con certeza
   return sections.join('\n\n');
 }
 
-// Recibe el mensaje de un ciudadano y el agentId ya resuelto por el
-// enrutamiento, y genera la respuesta usando las instrucciones generales,
-// los eventos recientes/en curso/futuros (con su estado ya calculado) y la
-// configuración (tono, contacto de escalación) de ese agente como
-// contexto. Devuelve { needsHuman: true, answer: null } cuando no hay
-// instrucciones ni eventos aplicables o el agente no existe, en vez de
-// responder a ciegas.
-async function generateAnswer(citizenMessage, agentId) {
+// Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
+// enrutamiento y el chatId de la conversación (para recuperar su
+// historial reciente), y genera la respuesta usando las instrucciones
+// generales, los eventos recientes/en curso/futuros (con su estado ya
+// calculado) y la configuración (tono, contacto de escalación) de ese
+// agente como contexto. Devuelve { needsHuman: true, answer: null } cuando
+// no hay instrucciones ni eventos aplicables o el agente no existe, en vez
+// de responder a ciegas.
+async function generateAnswer(citizenMessage, agentId, chatId) {
   const today = new Date().toISOString().slice(0, 10);
 
-  const [instructions, agent, events] = await Promise.all([
-    getAgentInstructions(agentId),
+  const [instructions, agent, events, history] = await Promise.all([
+    getRelevantInstructions(agentId, citizenMessage),
     getAgent(agentId),
     getRelevantEvents(agentId, today),
+    getRecentHistory(agentId, chatId),
   ]);
 
   if (!agent || (instructions.length === 0 && events.length === 0)) {
@@ -147,11 +150,23 @@ async function generateAnswer(citizenMessage, agentId) {
     return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
   }
 
-  const system = buildSystemPrompt(instructions, agent, events, today);
+  // Las instrucciones ahora son el resultado de una búsqueda semántica sobre
+  // la pregunta del ciudadano, así que ya no son idénticas entre mensajes de
+  // una misma conversación (antes sí, cuando se traían todas). El
+  // cache_control sigue teniendo valor dentro del bucle de tool use de más
+  // abajo: ese mismo system prompt puede enviarse varias veces (hasta
+  // MAX_TOOL_CALLS + 1) para un único mensaje del ciudadano.
+  const system = [
+    {
+      type: 'text',
+      text: buildSystemPrompt(instructions, agent, events, today),
+      cache_control: { type: 'ephemeral' },
+    },
+  ];
   const hasReadableUrls =
     instructions.some((instr) => instr.allow_url_reading) || events.some((ev) => ev.allow_url_reading);
 
-  const messages = [{ role: 'user', content: citizenMessage }];
+  const messages = [...history, { role: 'user', content: citizenMessage }];
   let toolCallCount = 0;
   let text = '';
 
@@ -196,4 +211,4 @@ async function generateAnswer(citizenMessage, agentId) {
   return { needsHuman: false, answer: text };
 }
 
-module.exports = { generateAnswer };
+module.exports = { generateAnswer, buildSystemPrompt };

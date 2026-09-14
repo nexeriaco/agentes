@@ -21,7 +21,8 @@ async function getRelevantEvents(agentId, today) {
     .select('id, title, description, start_date, end_date, location, url, allow_url_reading')
     .eq('agent_id', agentId)
     .eq('active', true)
-    .gte('end_date', cutoff);
+    .gte('end_date', cutoff)
+    .order('id');
 
   if (error) throw error;
   return data;
