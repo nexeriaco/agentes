@@ -185,6 +185,14 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       ...(offerTool ? { tools: [BUSCAR_URL_TOOL] } : {}),
     });
 
+    console.log('[claude-usage]', {
+      chatId,
+      input_tokens: response.usage.input_tokens,
+      output_tokens: response.usage.output_tokens,
+      cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+      cache_read_input_tokens: response.usage.cache_read_input_tokens,
+    });
+
     messages.push({ role: 'assistant', content: response.content });
 
     const toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
