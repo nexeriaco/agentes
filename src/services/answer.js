@@ -13,6 +13,14 @@ const MODEL = 'claude-haiku-4-5';
 // camino feliz, se deja margen para reintentos).
 const MAX_TOOL_CALLS = 4;
 
+// Similitud mínima para responder sin pasar por Claude en absoluto (filas
+// response_mode='directo', p. ej. Transparencia). Más exigente que
+// SIMILARITY_THRESHOLD (0.4, en agentInstructions.js) porque aquí no hay
+// ningún criterio de Claude revisando después: un falso positivo se envía
+// tal cual, con seguridad total. Punto de partida a calibrar con datos
+// reales, igual que se calibró el 0.4 general.
+const DIRECT_RESPONSE_THRESHOLD = 0.55;
+
 // Punto de baja confianza: si Claude no encuentra un caso claro, responde
 // exactamente este texto en vez de inventar una respuesta.
 // TODO: cuando exista un canal de derivación a humano (ej. notificar a un
@@ -192,6 +200,20 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   if (!agent || (instructions.length === 0 && events.length === 0)) {
     // TODO: derivar a un humano.
     return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
+  }
+
+  // Filas response_mode='directo' (p. ej. Transparencia): nunca pasan por
+  // Claude. La instrucción de la fila mejor puntuada (ya viene ordenada por
+  // similitud desde match_agent_instructions) ES el texto literal a enviar,
+  // no una instrucción para que Claude redacte. Si la similitud no llega al
+  // umbral, se deriva a humano igual que en el caso de "sin match" de
+  // arriba, en vez de arriesgarse a mandar un enlace equivocado.
+  const topInstruction = instructions[0];
+  if (topInstruction && topInstruction.response_mode === 'directo') {
+    if (topInstruction.similarity >= DIRECT_RESPONSE_THRESHOLD) {
+      return { needsHuman: false, answer: topInstruction.instruction };
+    }
+    return { needsHuman: true, answer: null, escalationContact: agent.escalation_contact };
   }
 
   // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con
