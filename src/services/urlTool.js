@@ -3,7 +3,7 @@ const { compile } = require('html-to-text');
 
 const MAX_BYTES = 20 * 1024 * 1024; // 20MB
 const FETCH_TIMEOUT_MS = 15000;
-const MAX_TEXT_CHARS = 15000; // recorte de texto devuelto a Claude (página o PDF)
+const MAX_TEXT_CHARS = 8000; // recorte de texto devuelto a Claude (página o PDF)
 const MIN_PDF_TEXT_CHARS = 40; // por debajo de esto, se asume PDF escaneado sin capa de texto
 const MAX_SCREENSHOT_PAGES = 8;
 

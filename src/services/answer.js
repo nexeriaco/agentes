@@ -38,6 +38,107 @@ const DIRECT_RESPONSE_MARGIN = 0.03;
 // en los dos puntos marcados abajo en vez de solo devolver needsHuman: true.
 const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
 
+// Precio Claude Haiku 4.5 (USD / millón de tokens). Caché = ephemeral 5 min.
+const HAIKU_USD_PER_MTOK = {
+  input: 1.0,
+  output: 5.0,
+  cache_write_5m: 1.25,
+  cache_read: 0.1,
+};
+
+// Línea final que Claude añade para trazar la fila usada; se elimina antes
+// de enviar al ciudadano. Formatos: FUENTE:uuid | FUENTE:evento:id | FUENTE:ninguna
+const FUENTE_LINE_RE = /\n*FUENTE:(.+)\s*$/i;
+
+function emptyUsage() {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  };
+}
+
+function addUsage(totals, usage) {
+  if (!usage) return totals;
+  totals.input_tokens += usage.input_tokens || 0;
+  totals.output_tokens += usage.output_tokens || 0;
+  totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
+  totals.cache_read_input_tokens += usage.cache_read_input_tokens || 0;
+  return totals;
+}
+
+function calculateHaikuCostUsd(usage) {
+  const cost =
+    ((usage.input_tokens || 0) * HAIKU_USD_PER_MTOK.input
+      + (usage.cache_creation_input_tokens || 0) * HAIKU_USD_PER_MTOK.cache_write_5m
+      + (usage.cache_read_input_tokens || 0) * HAIKU_USD_PER_MTOK.cache_read
+      + (usage.output_tokens || 0) * HAIKU_USD_PER_MTOK.output)
+    / 1_000_000;
+  return Number(cost.toFixed(6));
+}
+
+function summarizeInstruction(instr) {
+  if (!instr) return null;
+  return {
+    tabla: 'agent_instructions',
+    id: instr.id,
+    case_group: instr.case_group,
+    case_subgroup: instr.case_subgroup,
+    response_mode: instr.response_mode || null,
+    similarity: instr.similarity != null ? Number(instr.similarity.toFixed(4)) : null,
+  };
+}
+
+function summarizeEvent(event) {
+  if (!event) return null;
+  return {
+    tabla: 'agent_events',
+    id: event.id,
+    title: event.title,
+  };
+}
+
+function summarizeCandidates(instructions) {
+  return instructions.map(summarizeInstruction);
+}
+
+function extractFuente(rawText, instructions, events) {
+  const match = rawText.match(FUENTE_LINE_RE);
+  if (!match) {
+    return { answer: rawText.trim(), fuente: null, fuente_raw: null };
+  }
+
+  const answer = rawText.slice(0, match.index).trim();
+  const raw = match[1].trim();
+  const lower = raw.toLowerCase();
+
+  if (lower === 'ninguna') {
+    return { answer, fuente: null, fuente_raw: raw };
+  }
+
+  if (lower.startsWith('evento:')) {
+    const eventId = raw.slice('evento:'.length).trim();
+    const event = events.find((ev) => String(ev.id) === eventId);
+    return {
+      answer,
+      fuente: event ? summarizeEvent(event) : { tabla: 'agent_events', id: eventId, title: null },
+      fuente_raw: raw,
+    };
+  }
+
+  const instr = instructions.find((row) => String(row.id) === raw);
+  return {
+    answer,
+    fuente: instr ? summarizeInstruction(instr) : { tabla: 'agent_instructions', id: raw },
+    fuente_raw: raw,
+  };
+}
+
+function logConsulta(payload) {
+  console.log('[consulta]', payload);
+}
+
 function formatDate(isoTimestamp) {
   return isoTimestamp ? isoTimestamp.slice(0, 10) : 'sin fecha';
 }
@@ -73,13 +174,21 @@ function buildInstructionsBlock(instructions) {
               : 'solo puedes compartirla, no leer su contenido'
           })`
         : 'Sin URL asociada.';
-      return `Concejalía: ${instr.case_group}\nSubtema: ${instr.case_subgroup}\nInstrucción: ${instr.instruction}\n${urlLine}`;
+      return `ID: ${instr.id}\nConcejalía: ${instr.case_group}\nSubtema: ${instr.case_subgroup}\nInstrucción: ${instr.instruction}\n${urlLine}`;
     })
     .join('\n\n');
 }
 
+const MAX_EVENT_DESCRIPTION_CHARS = 400;
+
+function truncateDescription(text) {
+  if (!text) return 'sin descripción';
+  if (text.length <= MAX_EVENT_DESCRIPTION_CHARS) return text;
+  return `${text.slice(0, MAX_EVENT_DESCRIPTION_CHARS)}…`;
+}
+
 function buildEventsBlock(events, today) {
-  if (events.length === 0) return 'No hay eventos ni avisos registrados.';
+  if (events.length === 0) return 'No hay eventos ni avisos registrados en la ventana actual.';
 
   return events
     .map((ev) => {
@@ -90,7 +199,7 @@ function buildEventsBlock(events, today) {
               : 'solo puedes compartirla, no leer su contenido'
           })`
         : 'Sin URL asociada.';
-      return `Evento: ${ev.title}\nDescripción: ${ev.description || 'sin descripción'}\nVigencia: del ${formatDate(
+      return `ID: ${ev.id}\nEvento: ${ev.title}\nDescripción: ${truncateDescription(ev.description)}\nVigencia: del ${formatDate(
         ev.start_date
       )} al ${formatDate(ev.end_date)}\nESTADO (ya calculado, respecto a hoy): ${computeEventStatus(
         ev,
@@ -100,108 +209,135 @@ function buildEventsBlock(events, today) {
     .join('\n\n');
 }
 
-// Parte FIJA del system prompt: todo lo que no depende de la pregunta
-// concreta del ciudadano (tono, reglas generales, estilo, tarea, eventos del
-// día, explicación de la herramienta buscar_url). Es idéntica entre todos
-// los mensajes de una misma conversación (cambia como mucho una vez al día,
-// con `today`), así que es la que lleva el cache_control: así el segundo y
-// tercer mensaje de una conversación pueden leerla de caché en vez de
-// reescribirla. Los casos generales seleccionados por búsqueda semántica
-// SÍ cambian con cada pregunta, por eso van aparte en buildInstructionsPrompt
-// y se envían sin cache_control (ver generateAnswer).
+// Parte FIJA del system prompt (tono, reglas, eventos de la ventana, tools).
+// Idéntica entre mensajes de la misma conversación el mismo día → cache_control.
+// Los casos semánticos van en buildInstructionsPrompt (sin cache_control).
 function buildFixedSystemPrompt(agent, events, today) {
-  const sections = [
-    `Eres el asistente virtual de un ayuntamiento. Hoy es ${today}.`,
-    `A continuación tienes eventos y avisos del calendario municipal (desde hace 60 días hasta cualquier fecha futura, sin límite). Cada evento ya trae su ESTADO calculado (EN CURSO / YA FINALIZÓ / FUTURO): confía en ese estado tal cual, no lo recalcules ni lo cuestiones. Pueden ser información puntual (una feria, una excursión) o excepciones a una instrucción general (un cierre, una avería, un cambio de horario):`,
-    buildEventsBlock(events, today),
-  ];
+  const tone = agent.tone_instructions
+    ? agent.tone_instructions
+    : '(sin instrucciones de tono adicionales)';
 
-  sections.push(`Dispones de una herramienta llamada buscar_url para consultar en tiempo real páginas web y documentos PDF públicos. Solo puedes usarla sobre una URL asociada a un caso o evento marcado como "puedes leer su contenido" — para las marcadas como "solo puedes compartirla, no leer su contenido" nunca la uses, límitate a mencionar la URL tal cual. Cuando uses la herramienta sobre una página, revisa su contenido para ver si hay un documento (normalmente un PDF) relacionado específicamente con la consulta del ciudadano; si lo hay, vuelve a usar la herramienta sobre la URL exacta de ese documento (tal como aparece en el contenido que acabas de recibir, nunca inventada ni recordada de memoria) para leer su contenido antes de responder.
+  const escalationBlock = agent.escalation_contact
+    ? `<internal_only>
+Contacto de escalación interno: ${agent.escalation_contact}.
+Nunca lo menciones, sugieras ni escribas en la respuesta al ciudadano.
+</internal_only>
 
-Si el documento es un PDF con texto extraíble, recibirás ese texto directamente. Si es un PDF escaneado sin texto extraíble (por ejemplo, un documento fotografiado o impreso a mano), en su lugar recibirás sus páginas como imágenes: analízalas visualmente igual que harías con cualquier otra imagen para extraer la información que necesites, sin tratarlo como un fallo ni mencionárselo al ciudadano. Si aun así no consigues obtener información útil de un documento, no inventes su contenido bajo ningún concepto.`);
+`
+    : '';
 
-  if (agent.tone_instructions) {
-    sections.push(`Tono y estilo que debes usar en tus respuestas: ${agent.tone_instructions}`);
-  }
+  return `<role>
+Eres el asistente virtual de un ayuntamiento. Hoy es ${today}.
+Respondes a ciudadanos por chat: cercano, breve y en texto plano.
+</role>
 
-  if (agent.escalation_contact) {
-    sections.push(
-      `Contacto interno de escalación: ${agent.escalation_contact}. Este dato es SOLO para uso interno del sistema. Bajo ninguna circunstancia lo escribas, menciones, sugieras ni incluyas en tu respuesta al ciudadano, ni siquiera como recomendación de "puedes llamar al...". No tiene ningún otro uso en esta tarea.`
-    );
-  }
+<sources>
+Fuentes válidas SOLO de este turno:
+1. Casos generales del bloque <relevant_cases>.
+2. Eventos de <events> cuyo título, descripción o ubicación mencionen explícitamente el mismo lugar, servicio o tema de la consulta.
+3. Contenido devuelto por buscar_url en este turno, solo de URLs marcadas como "puedes leer su contenido".
 
-  sections.push(`REGLA ESTRICTA sobre inferencias entre eventos: cada evento es independiente de los demás. NUNCA asumas que un evento afecta a un lugar, servicio o tema que no menciona explícitamente por su nombre en el título, la descripción o la ubicación. Dos eventos distintos NO están relacionados entre sí solo por coincidir en fechas o por ocurrir en el mismo municipio — solo lo están si el texto de alguno de ellos menciona expresamente al otro tema.
+No son fuente: memoria del modelo, conocimiento general, ni datos de turnos anteriores (aunque tú los hayas escrito).
+Si un dato concreto (teléfono, email, dirección, cifra, horario, fecha, nombre de entidad) no aparece literalmente en una fuente válida de este turno, no lo escribas.
+</sources>
 
-Ejemplo de lo que NUNCA debes hacer: si hay un evento sobre una avería o corte de agua/luz en una calle o barrio, y la consulta es sobre la piscina municipal (o cualquier otro servicio), y ese evento de avería NO menciona la piscina (ni ese servicio) en su título, descripción o ubicación, entonces NO digas que "podría estar afectando también" a la piscina, ni sugieras esa posibilidad de ninguna forma. Trata ambos eventos como completamente independientes.
+<events>
+Calendario municipal filtrado: solo eventos EN CURSO y FUTURO que empiezan en los próximos 90 días. Cada ítem trae ESTADO ya calculado (EN CURSO / FUTURO): úsalo tal cual, no lo recalcules.
 
-Si la información disponible no permite confirmar ni descartar algo con certeza, dilo explícitamente ("no tengo información confirmada sobre eso") en vez de inferir, suponer o construir una conexión que no está en los datos.`);
+${buildEventsBlock(events, today)}
+</events>
 
-  sections.push(`REGLA ESTRICTA sobre datos concretos (teléfonos, emails, direcciones, cifras, horarios, fechas...): nunca escribas un dato concreto que no esté copiado literalmente de alguno de los casos generales indicados a continuación en este mensaje, o de una respuesta tuya anterior en esta misma conversación. Aunque por el hilo de la conversación creas saber a qué entidad se refiere el ciudadano, si el caso que la cubre no aparece entre los indicados a continuación esta vez, NO completes el dato de memoria ni lo inventes con un formato plausible: dile con naturalidad que no tienes ese dato a mano ahora mismo y pídele que reformule la pregunta mencionando de qué o quién se trata, o responde ${HUMAN_HANDOFF_SENTINEL} si no hay forma clara de continuar. Un dato inventado, aunque tenga buena pinta, es mucho peor que decir que no lo tienes.`);
+<tools>
+Herramienta buscar_url: solo sobre URLs asociadas a un caso o evento con "puedes leer su contenido". Si dice "solo puedes compartirla", menciona la URL y no la abras.
+Si al leer una página aparece un PDF o documento concreto relacionado con la consulta, vuelve a llamar la tool con esa URL exacta (tal como aparece en el resultado; nunca inventada).
+PDFs con texto → usa el texto. PDFs escaneados → analizarás imágenes de páginas; no digas al ciudadano que es un escaneo. Si no hay información útil, no inventes el contenido.
+</tools>
 
-  sections.push(`ESTILO de tu respuesta (muy importante, aplica siempre):
-- Texto plano, sin ningún formato markdown: nada de asteriscos, negrita, cursiva, encabezados ni listas con guiones o números.
-- No escribas etiquetas como "Caso aplicable:", "Estado actual:", "Información actual:" ni similares. Identificar el caso y el evento es solo para tu razonamiento interno; el ciudadano no debe ver esa etiqueta, solo la respuesta en sí.
-- Escribe como una persona del ayuntamiento contestando un chat: cercana, natural, en frases corridas, no como un informe.
-- Sé breve. Evita coletillas de cierre genéricas como "te recomendamos que consultes", "no dudes en contactar" o "cualquier duda que tengas" — si hace falta un siguiente paso, dilo de forma simple y concreta, sin relleno.`);
+<tone>
+${tone}
+</tone>
 
-  sections.push(`EJEMPLOS de estilo (ilustrativos: sirven para que veas el tono y el formato esperado, no son casos reales de este ayuntamiento — nunca repitas su contenido literal en una respuesta real, solo imita el tono y la forma):
+${escalationBlock}<rules>
+1. Eventos independientes: un evento solo afecta a lo que nombra explícitamente. No relacionas eventos por fechas, municipio o proximidad temática.
+2. Prioridad: si un evento EN CURSO nombra el mismo lugar/servicio y modifica una instrucción general, prioriza el evento y dilo con naturalidad.
+3. Ambigüedad entre entidades distintas (varios colegios, centros, oficinas…): pregunta cuál, listando solo opciones que estén en las fuentes de este turno. Si son intercambiables para lo preguntado, responde con cualquiera.
+4. Inferencias: no completes huecos. Si no puedes confirmar con una fuente de este turno, no supongas.
+</rules>
 
-Ciudadano: "¿dónde puedo pagar la tasa de basuras?"
-Respuesta correcta: Puedes pagarla online en la sede electrónica del ayuntamiento, o presencialmente en la oficina de recaudación llevando el número de recibo a mano.
+<output>
+- Texto plano: sin markdown, sin etiquetas del tipo "Caso aplicable:" / "Estado actual:".
+- Una sola respuesta final al ciudadano: la información pedida, o una pregunta de aclaración, o exactamente ${HUMAN_HANDOFF_SENTINEL}.
+- No muestres razonamiento, dudas ni autocorrecciones.
+- Frases naturales de chat municipal; breve; sin coletillas genéricas ("no dudes en contactar", etc.).
+- Datos concretos: cópialos tal cual de la fuente; no parafrasees teléfonos, emails, direcciones, cifras, horarios ni fechas.
+- Tras la respuesta al ciudadano, en la ÚLTIMA línea y nada más en esa línea, escribe exactamente uno de estos formatos (el sistema la eliminará antes de enviarla):
+  FUENTE:<ID del caso de agent_instructions>
+  FUENTE:evento:<ID del evento>
+  FUENTE:ninguna
+  Usa el ID del caso o evento del que tomaste la información principal. Si respondiste solo pidiendo aclaración o con ${HUMAN_HANDOFF_SENTINEL}, usa FUENTE:ninguna.
+</output>
 
-Ciudadano: "¿está abierta la piscina municipal este fin de semana?"
-Respuesta correcta: Ahora mismo está cerrada por una avería en el sistema de filtrado, se espera que reabra la semana que viene en cuanto quede reparada.
+<fallback>
+Si ningún caso ni evento aplicable cubre la consulta con claridad, o falta un dato concreto que el ciudadano pide y no está en las fuentes de este turno, responde con exactamente:
+${HUMAN_HANDOFF_SENTINEL}
+FUENTE:ninguna
+</fallback>
 
-Ciudadano: "¿cuándo es el próximo pleno municipal?"
-Respuesta correcta: El próximo pleno ordinario es el tercer jueves del mes, a las 19:00 en el salón de plenos.
+<examples>
+Estos ejemplos enseñan FORMATO y decisión, no hechos de este ayuntamiento. No reutilices sus datos.
 
-Ciudadano: "el mercadillo semanal ¿sigue siendo los martes?"
-Respuesta correcta: Sí, el mercadillo sigue siendo los martes por la mañana, en su ubicación de siempre junto al recinto ferial.
+<example>
+<user>¿Me pasas el teléfono?</user>
+<assistant>Ese dato ahora mismo no lo tengo a mano. ¿Me dices de qué o de quién lo necesitas?
+FUENTE:ninguna</assistant>
+</example>
 
-Ciudadano: "¿hay algún corte de agua previsto en mi calle esta semana?"
-Respuesta correcta (con un evento EN CURSO que menciona esa calle): Sí, hay un corte de agua programado en esa calle por una avería que se está reparando; se espera que quede resuelto en los próximos días.
+<example>
+<user>Pregunta ambigua entre dos entidades distintas presentes en los casos</user>
+<assistant>Hay más de una opción. ¿Te refieres a A o a B?
+FUENTE:ninguna</assistant>
+</example>
 
-Ciudadano: "¿puedo montar una acampada con caravana en el parque municipal?"
-Respuesta correcta (sin caso ni evento que lo respalde con certeza): ${HUMAN_HANDOFF_SENTINEL}
+<example>
+<user>Consulta sin caso ni evento aplicable</user>
+<assistant>${HUMAN_HANDOFF_SENTINEL}
+FUENTE:ninguna</assistant>
+</example>
 
-Ciudadano: "¿me pasas el teléfono del colegio?"
-Respuesta correcta (si hay más de un colegio en el municipio y no se especifica cuál): En el pueblo hay más de un colegio, ¿te refieres al CEIP San Roque o al CEIP Santa Ana? Dime cuál y te doy su teléfono.
+<example>
+<user>Pregunta cubierta por un caso, con un dato literal en la instrucción</user>
+<assistant>(frase natural que incluye ese dato tal cual, sin etiquetas ni markdown)
+FUENTE:(id del caso usado)</assistant>
+</example>
+</examples>
 
-Ciudadano: "¿y el teléfono?" (tras haber hablado del ayuntamiento, pero sin que esta vez la fila del ayuntamiento esté entre los casos indicados a continuación)
-Respuesta correcta: Ese dato ahora mismo no lo tengo a mano, ¿me puedes decir otra vez de qué o de quién necesitas el teléfono?
-
-Fíjate en el estilo de las respuestas correctas: frases naturales y directas, sin etiquetas, sin markdown y sin coletillas de cierre genéricas — y en que la última, al no haber una base clara, no inventa nada; la del colegio, al no saber a cuál se refiere el ciudadano, pregunta en vez de adivinar; la del teléfono, aunque el hilo de la conversación sugiera de qué se trata, no inventa el dato al no tenerlo confirmado en este turno.`);
-
-  sections.push(`Tu tarea:
-1. Identifica cuál de los casos generales indicados a continuación (en el siguiente bloque) aplica a la consulta del ciudadano (para tu razonamiento interno, no lo escribas como etiqueta).
-2. Si más de un caso general aplica a la consulta pero corresponden a lugares, servicios o entidades distintas entre sí y con información distinta cada una (por ejemplo, varios colegios, varios centros de salud, varias oficinas del mismo tipo) y la consulta del ciudadano no especifica a cuál se refiere, no elijas ninguno al azar ni respondas con el que tengas primero: pregúntale cuál de ellos necesita, mencionando las opciones concretas de que dispongas para que pueda elegir fácilmente. Esto no aplica si los casos dan la misma información o son intercambiables para lo que se pregunta — en ese caso responde con normalidad usando cualquiera de ellos.
-3. Considera únicamente los eventos que mencionen explícitamente, por nombre, el mismo lugar, servicio o tema de la consulta en su título, descripción o ubicación (ver la regla estricta anterior). Ignora cualquier otro evento, aunque esté EN CURSO: no lo menciones ni lo relaciones con la respuesta.
-4. Usa el ESTADO ya calculado de cada evento relevante (EN CURSO / YA FINALIZÓ / FUTURO) tal cual te lo doy. Si el estado es YA FINALIZÓ, ese evento ya no tiene ningún efecto: aplica la instrucción general o el evento EN CURSO que corresponda como si la excepción ya finalizada nunca hubiera existido, sin matices ni dudas sobre si "podría seguir" vigente.
-5. Si un evento EN CURSO que menciona explícitamente el mismo lugar/servicio contradice o modifica una instrucción general (un cierre puntual, una avería, un cambio de horario), da prioridad a ese evento sobre la instrucción general: menciona explícitamente la excepción y no respondas solo con la información general.
-6. Responde con la información del caso y, si aplica, del evento relevante, reflejando su estado (ya finalizó / en curso / futuro) con una frase natural — sin etiquetas ni formato, según las reglas de ESTILO de arriba.
-7. Si ninguno de los casos generales ni de los eventos aplica con claridad y certeza a la consulta, no infieras ni completes con suposiciones: responde únicamente con el texto ${HUMAN_HANDOFF_SENTINEL}, sin nada más.
-8. Entrega solo la conclusión final ya resuelta (una respuesta con la información pedida, la pregunta de aclaración del paso 2, o la derivación del paso 7 — nunca varias cosas a la vez), con seguridad y sin hedging. No incluyas en tu respuesta el proceso de razonamiento, dudas ni autocorrecciones ("pero tengo que corregir", "revisando de nuevo"): el ciudadano solo debe ver la respuesta final, clara y directa, en el estilo indicado.`);
-
-  return sections.join('\n\n');
+<task>
+1. Elige el caso aplicable (razonamiento interno; no lo etiquetes en la respuesta).
+2. Filtra eventos según las reglas.
+3. Si hace falta y está permitido, usa buscar_url.
+4. Responde según <output>, o <fallback> si no hay base suficiente.
+5. Cierra siempre con la línea FUENTE:... indicada en <output>.
+</task>`;
 }
 
-// Parte DINÁMICA: los casos generales seleccionados por búsqueda semántica
-// para la pregunta concreta de este mensaje. Cambia en cada mensaje, así que
-// se envía como bloque de system aparte, SIN cache_control, después del
-// bloque fijo (ver "Render order: tools -> system -> messages" — un bloque
-// sin marcador situado después del breakpoint no invalida la caché del
-// bloque fijo que lo precede).
+// Parte DINÁMICA: casos semánticos de este mensaje (sin cache_control).
 function buildInstructionsPrompt(instructions) {
   if (instructions.length === 0) {
-    return 'No se ha encontrado ningún caso general con relación suficiente con esta consulta concreta del ciudadano.';
+    return `<relevant_cases>
+Ninguno con similitud suficiente.
+</relevant_cases>`;
   }
-  return `Casos generales seleccionados como más relevantes para la consulta actual del ciudadano, con instrucciones sobre cómo atenderla:\n\n${buildInstructionsBlock(instructions)}`;
+  return `<relevant_cases>
+Casos generales más relevantes para esta consulta. Son fuente válida solo si aplican de verdad a lo preguntado:
+
+${buildInstructionsBlock(instructions)}
+</relevant_cases>`;
 }
 
 // Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
 // enrutamiento y el chatId de la conversación (para recuperar su
 // historial reciente), y genera la respuesta usando las instrucciones
-// generales, los eventos recientes/en curso/futuros (con su estado ya
+// generales, los eventos vigentes/próximos 90 días (con su estado ya
 // calculado) y la configuración (tono, contacto de escalación) de ese
 // agente como contexto. Devuelve { needsHuman: true, answer: null } cuando
 // no hay instrucciones ni eventos aplicables o el agente no existe, en vez
@@ -218,6 +354,18 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   if (!agent || (instructions.length === 0 && events.length === 0)) {
     // TODO: derivar a un humano.
+    logConsulta({
+      fecha: new Date().toISOString(),
+      modo: 'handoff',
+      consulta: citizenMessage,
+      respuesta: null,
+      fuente: null,
+      candidatas: summarizeCandidates(instructions),
+      tokens: emptyUsage(),
+      coste_usd: 0,
+      modelo: null,
+      motivo: !agent ? 'agente_inactivo_o_inexistente' : 'sin_instrucciones_ni_eventos',
+    });
     return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
   }
 
@@ -229,7 +377,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   // con "instructions" completo, tal como si fuera una fila IA (Claude
   // decide con todo el contexto en vez de mandar un enlace equivocado a
   // ciegas). Solo se deriva a humano sin pasar por Claude si, tras el
-  // filtro de 0.4 general, no queda ninguna instrucción ni evento (línea 200).
+  // filtro de 0.4 general, no queda ninguna instrucción ni evento.
   const topInstruction = instructions[0];
   const secondInstruction = instructions[1];
   const hasEnoughMargin = !secondInstruction
@@ -240,16 +388,16 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     && topInstruction.similarity >= DIRECT_RESPONSE_THRESHOLD
     && hasEnoughMargin
   ) {
-    // Mismas columnas que la hoja de seguimiento en Drive, solo para el
-    // log de Railway (no escribe en la hoja). Sin Claude: tokens y coste
-    // vacíos.
-    console.log('[consulta-directa]', {
+    logConsulta({
       fecha: new Date().toISOString(),
+      modo: 'directo',
       consulta: citizenMessage,
       respuesta: topInstruction.instruction,
-      tokens_entrada: '',
-      tokens_salida: '',
-      coste: '',
+      fuente: summarizeInstruction(topInstruction),
+      candidatas: summarizeCandidates(instructions),
+      tokens: emptyUsage(),
+      coste_usd: 0,
+      modelo: null,
     });
     return { needsHuman: false, answer: topInstruction.instruction };
   }
@@ -277,6 +425,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   const messages = [...history, { role: 'user', content: citizenMessage }];
   let toolCallCount = 0;
   let text = '';
+  const usageTotals = emptyUsage();
 
   // Bucle de tool use: mientras Claude pida buscar_url (hasta MAX_TOOL_CALLS
   // veces) se ejecuta de verdad y su resultado se devuelve como tool_result.
@@ -293,14 +442,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       ...(offerTool ? { tools: [BUSCAR_URL_TOOL] } : {}),
     });
 
-    console.log('[claude-usage]', {
-      chatId,
-      input_tokens: response.usage.input_tokens,
-      output_tokens: response.usage.output_tokens,
-      cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-      cache_read_input_tokens: response.usage.cache_read_input_tokens,
-    });
-
+    addUsage(usageTotals, response.usage);
     messages.push({ role: 'assistant', content: response.content });
 
     const toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
@@ -319,12 +461,42 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     messages.push({ role: 'user', content: toolResults });
   }
 
-  if (text === HUMAN_HANDOFF_SENTINEL) {
+  const { answer, fuente, fuente_raw } = extractFuente(text, instructions, events);
+  const costeUsd = calculateHaikuCostUsd(usageTotals);
+
+  if (answer === HUMAN_HANDOFF_SENTINEL || text === HUMAN_HANDOFF_SENTINEL) {
     // TODO: derivar a un humano.
+    logConsulta({
+      fecha: new Date().toISOString(),
+      modo: 'handoff',
+      consulta: citizenMessage,
+      respuesta: HUMAN_HANDOFF_SENTINEL,
+      fuente,
+      fuente_raw,
+      candidatas: summarizeCandidates(instructions),
+      tokens: usageTotals,
+      coste_usd: costeUsd,
+      modelo: MODEL,
+      motivo: 'sentinel_derivar_a_humano',
+    });
     return { needsHuman: true, answer: null, escalationContact: agent.escalation_contact };
   }
 
-  return { needsHuman: false, answer: text };
+  logConsulta({
+    fecha: new Date().toISOString(),
+    modo: 'ia',
+    consulta: citizenMessage,
+    respuesta: answer,
+    fuente,
+    fuente_raw,
+    candidatas: summarizeCandidates(instructions),
+    tokens: usageTotals,
+    coste_usd: costeUsd,
+    modelo: MODEL,
+    tool_calls: toolCallCount,
+  });
+
+  return { needsHuman: false, answer };
 }
 
 module.exports = { generateAnswer, buildFixedSystemPrompt, buildInstructionsPrompt };
