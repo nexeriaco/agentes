@@ -21,6 +21,16 @@ const MAX_TOOL_CALLS = 4;
 // reales, igual que se calibró el 0.4 general.
 const DIRECT_RESPONSE_THRESHOLD = 0.55;
 
+// Margen mínimo de separación (similitud coseno) que debe sacar la mejor
+// candidata a la segunda para responder en 'directo' sin pasar por Claude.
+// Si dos o más casos quedan casi empatados, es señal de ambigüedad real
+// (típico de grupos de filas muy parecidas entre sí, como "teléfono de
+// [departamento]" repetido por concejalía) y ganar por decimales no es
+// garantía suficiente de haber acertado la fila correcta. Punto de partida
+// a calibrar con datos reales, igual que SIMILARITY_THRESHOLD y
+// DIRECT_RESPONSE_THRESHOLD.
+const DIRECT_RESPONSE_MARGIN = 0.03;
+
 // Punto de baja confianza: si Claude no encuentra un caso claro, responde
 // exactamente este texto en vez de inventar una respuesta.
 // TODO: cuando exista un canal de derivación a humano (ej. notificar a un
@@ -152,16 +162,20 @@ Respuesta correcta (con un evento EN CURSO que menciona esa calle): Sí, hay un 
 Ciudadano: "¿puedo montar una acampada con caravana en el parque municipal?"
 Respuesta correcta (sin caso ni evento que lo respalde con certeza): ${HUMAN_HANDOFF_SENTINEL}
 
-Fíjate en el estilo de las respuestas correctas: frases naturales y directas, sin etiquetas, sin markdown y sin coletillas de cierre genéricas — y en que la última, al no haber una base clara, no inventa nada.`);
+Ciudadano: "¿me pasas el teléfono del colegio?"
+Respuesta correcta (si hay más de un colegio en el municipio y no se especifica cuál): En el pueblo hay más de un colegio, ¿te refieres al CEIP San Roque o al CEIP Santa Ana? Dime cuál y te doy su teléfono.
+
+Fíjate en el estilo de las respuestas correctas: frases naturales y directas, sin etiquetas, sin markdown y sin coletillas de cierre genéricas — y en que la última, al no haber una base clara, no inventa nada; la del colegio, al no saber a cuál se refiere el ciudadano, pregunta en vez de adivinar.`);
 
   sections.push(`Tu tarea:
 1. Identifica cuál de los casos generales indicados a continuación (en el siguiente bloque) aplica a la consulta del ciudadano (para tu razonamiento interno, no lo escribas como etiqueta).
-2. Considera únicamente los eventos que mencionen explícitamente, por nombre, el mismo lugar, servicio o tema de la consulta en su título, descripción o ubicación (ver la regla estricta anterior). Ignora cualquier otro evento, aunque esté EN CURSO: no lo menciones ni lo relaciones con la respuesta.
-3. Usa el ESTADO ya calculado de cada evento relevante (EN CURSO / YA FINALIZÓ / FUTURO) tal cual te lo doy. Si el estado es YA FINALIZÓ, ese evento ya no tiene ningún efecto: aplica la instrucción general o el evento EN CURSO que corresponda como si la excepción ya finalizada nunca hubiera existido, sin matices ni dudas sobre si "podría seguir" vigente.
-4. Si un evento EN CURSO que menciona explícitamente el mismo lugar/servicio contradice o modifica una instrucción general (un cierre puntual, una avería, un cambio de horario), da prioridad a ese evento sobre la instrucción general: menciona explícitamente la excepción y no respondas solo con la información general.
-5. Responde con la información del caso y, si aplica, del evento relevante, reflejando su estado (ya finalizó / en curso / futuro) con una frase natural — sin etiquetas ni formato, según las reglas de ESTILO de arriba.
-6. Si ninguno de los casos generales ni de los eventos aplica con claridad y certeza a la consulta, no infieras ni completes con suposiciones: responde únicamente con el texto ${HUMAN_HANDOFF_SENTINEL}, sin nada más.
-7. Entrega solo la conclusión final ya resuelta, con seguridad y sin hedging. No incluyas en tu respuesta el proceso de razonamiento, dudas ni autocorrecciones ("pero tengo que corregir", "revisando de nuevo"): el ciudadano solo debe ver la respuesta final, clara y directa, en el estilo indicado.`);
+2. Si más de un caso general aplica a la consulta pero corresponden a lugares, servicios o entidades distintas entre sí y con información distinta cada una (por ejemplo, varios colegios, varios centros de salud, varias oficinas del mismo tipo) y la consulta del ciudadano no especifica a cuál se refiere, no elijas ninguno al azar ni respondas con el que tengas primero: pregúntale cuál de ellos necesita, mencionando las opciones concretas de que dispongas para que pueda elegir fácilmente. Esto no aplica si los casos dan la misma información o son intercambiables para lo que se pregunta — en ese caso responde con normalidad usando cualquiera de ellos.
+3. Considera únicamente los eventos que mencionen explícitamente, por nombre, el mismo lugar, servicio o tema de la consulta en su título, descripción o ubicación (ver la regla estricta anterior). Ignora cualquier otro evento, aunque esté EN CURSO: no lo menciones ni lo relaciones con la respuesta.
+4. Usa el ESTADO ya calculado de cada evento relevante (EN CURSO / YA FINALIZÓ / FUTURO) tal cual te lo doy. Si el estado es YA FINALIZÓ, ese evento ya no tiene ningún efecto: aplica la instrucción general o el evento EN CURSO que corresponda como si la excepción ya finalizada nunca hubiera existido, sin matices ni dudas sobre si "podría seguir" vigente.
+5. Si un evento EN CURSO que menciona explícitamente el mismo lugar/servicio contradice o modifica una instrucción general (un cierre puntual, una avería, un cambio de horario), da prioridad a ese evento sobre la instrucción general: menciona explícitamente la excepción y no respondas solo con la información general.
+6. Responde con la información del caso y, si aplica, del evento relevante, reflejando su estado (ya finalizó / en curso / futuro) con una frase natural — sin etiquetas ni formato, según las reglas de ESTILO de arriba.
+7. Si ninguno de los casos generales ni de los eventos aplica con claridad y certeza a la consulta, no infieras ni completes con suposiciones: responde únicamente con el texto ${HUMAN_HANDOFF_SENTINEL}, sin nada más.
+8. Entrega solo la conclusión final ya resuelta (una respuesta con la información pedida, la pregunta de aclaración del paso 2, o la derivación del paso 7 — nunca varias cosas a la vez), con seguridad y sin hedging. No incluyas en tu respuesta el proceso de razonamiento, dudas ni autocorrecciones ("pero tengo que corregir", "revisando de nuevo"): el ciudadano solo debe ver la respuesta final, clara y directa, en el estilo indicado.`);
 
   return sections.join('\n\n');
 }
@@ -190,12 +204,12 @@ function buildInstructionsPrompt(instructions) {
 async function generateAnswer(citizenMessage, agentId, chatId) {
   const today = new Date().toISOString().slice(0, 10);
 
-  const [instructions, agent, events, history] = await Promise.all([
-    getRelevantInstructions(agentId, citizenMessage),
+  const [agent, events, history] = await Promise.all([
     getAgent(agentId),
     getRelevantEvents(agentId, today),
     getRecentHistory(agentId, chatId),
   ]);
+  const instructions = await getRelevantInstructions(agentId, citizenMessage, history);
 
   if (!agent || (instructions.length === 0 && events.length === 0)) {
     // TODO: derivar a un humano.
@@ -206,25 +220,33 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   // Claude. La instrucción de la fila mejor puntuada (ya viene ordenada por
   // similitud desde match_agent_instructions) ES el texto literal a enviar,
   // no una instrucción para que Claude redacte. Si la similitud no llega al
-  // umbral, se deriva a humano igual que en el caso de "sin match" de
-  // arriba, en vez de arriesgarse a mandar un enlace equivocado.
+  // umbral, no se deriva a humano aquí: se sigue el flujo normal más abajo
+  // con "instructions" completo, tal como si fuera una fila IA (Claude
+  // decide con todo el contexto en vez de mandar un enlace equivocado a
+  // ciegas). Solo se deriva a humano sin pasar por Claude si, tras el
+  // filtro de 0.4 general, no queda ninguna instrucción ni evento (línea 200).
   const topInstruction = instructions[0];
-  if (topInstruction && topInstruction.response_mode === 'directo') {
-    if (topInstruction.similarity >= DIRECT_RESPONSE_THRESHOLD) {
-      // Mismas columnas que la hoja de seguimiento en Drive, solo para el
-      // log de Railway (no escribe en la hoja). Sin Claude: tokens y coste
-      // vacíos.
-      console.log('[consulta-directa]', {
-        fecha: new Date().toISOString(),
-        consulta: citizenMessage,
-        respuesta: topInstruction.instruction,
-        tokens_entrada: '',
-        tokens_salida: '',
-        coste: '',
-      });
-      return { needsHuman: false, answer: topInstruction.instruction };
-    }
-    return { needsHuman: true, answer: null, escalationContact: agent.escalation_contact };
+  const secondInstruction = instructions[1];
+  const hasEnoughMargin = !secondInstruction
+    || (topInstruction.similarity - secondInstruction.similarity) >= DIRECT_RESPONSE_MARGIN;
+  if (
+    topInstruction
+    && topInstruction.response_mode === 'directo'
+    && topInstruction.similarity >= DIRECT_RESPONSE_THRESHOLD
+    && hasEnoughMargin
+  ) {
+    // Mismas columnas que la hoja de seguimiento en Drive, solo para el
+    // log de Railway (no escribe en la hoja). Sin Claude: tokens y coste
+    // vacíos.
+    console.log('[consulta-directa]', {
+      fecha: new Date().toISOString(),
+      consulta: citizenMessage,
+      respuesta: topInstruction.instruction,
+      tokens_entrada: '',
+      tokens_salida: '',
+      coste: '',
+    });
+    return { needsHuman: false, answer: topInstruction.instruction };
   }
 
   // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con

@@ -16,15 +16,16 @@ const MATCH_COUNT = 5;
 // deja margen bajo el hueco real (~0.35 a ~0.43) sin colar negativos.
 const SIMILARITY_THRESHOLD = 0.4;
 
-// Dado un agentId y el mensaje del ciudadano, devuelve las instrucciones
-// activas de ese agente semánticamente más relevantes (embedding de la
-// pregunta vs. embedding de cada instrucción, vía pgvector vía la RPC
-// match_agent_instructions), limitadas a las MATCH_COUNT más similares y
-// filtradas por SIMILARITY_THRESHOLD. Si ninguna supera el umbral, devuelve
-// un array vacío: quien construya el prompt debe tratarlo como "no hay
-// información suficiente", no como "no hay instrucciones para este agente".
-async function getRelevantInstructions(agentId, citizenMessage) {
-  const queryEmbedding = await embedQuery(citizenMessage);
+// Dado un agentId y un texto de búsqueda ya resuelto, devuelve las
+// instrucciones activas de ese agente semánticamente más relevantes
+// (embedding del texto vs. embedding de cada instrucción, vía pgvector vía
+// la RPC match_agent_instructions), limitadas a las MATCH_COUNT más
+// similares y filtradas por SIMILARITY_THRESHOLD. Si ninguna supera el
+// umbral, devuelve un array vacío: quien construya el prompt debe tratarlo
+// como "no hay información suficiente", no como "no hay instrucciones para
+// este agente".
+async function matchInstructions(agentId, queryText) {
+  const queryEmbedding = await embedQuery(queryText);
 
   const { data, error } = await supabase.rpc('match_agent_instructions', {
     query_embedding: queryEmbedding,
@@ -35,6 +36,33 @@ async function getRelevantInstructions(agentId, citizenMessage) {
   if (error) throw error;
 
   return data.filter((row) => row.similarity >= SIMILARITY_THRESHOLD);
+}
+
+// Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
+// reciente de la conversación, devuelve las instrucciones más relevantes.
+// Primero se prueba con el mensaje tal cual. Si no hay match, el mensaje
+// puede ser una respuesta corta o ambigua fuera de contexto ("el segundo",
+// "el San Roque", "sí") a una pregunta de aclaración que el propio bot
+// acaba de hacer (p. ej. tras detectar varios casos posibles, ver el paso 2
+// de buildFixedSystemPrompt en answer.js): por sí sola no se parece
+// semánticamente a ninguna fila, pero el último mensaje del bot ya contiene
+// los nombres/términos concretos de las opciones. En ese caso se reintenta
+// concatenando ese último mensaje del bot con el mensaje del ciudadano, para
+// que la búsqueda semántica tenga ese contexto disponible.
+async function getRelevantInstructions(agentId, citizenMessage, history = []) {
+  const directMatches = await matchInstructions(agentId, citizenMessage);
+  if (directMatches.length > 0) return directMatches;
+
+  let lastBotMessage = null;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    if (history[i].role === 'assistant') {
+      lastBotMessage = history[i];
+      break;
+    }
+  }
+  if (!lastBotMessage) return directMatches;
+
+  return matchInstructions(agentId, `${lastBotMessage.content}\n${citizenMessage}`);
 }
 
 module.exports = { getRelevantInstructions, SIMILARITY_THRESHOLD };
