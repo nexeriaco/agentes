@@ -8,11 +8,23 @@ const telegram = require('./client');
 const GENERIC_HANDOFF_MESSAGE =
   'Gracias por tu mensaje. Un miembro de nuestro equipo se pondrá en contacto contigo en breve.';
 
+const WELCOME_MESSAGE =
+  '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información que necesites.';
+
+// Al abrir el bot, Telegram envía solo "/start" (o "/start@nombre_bot").
+// No es un comando que el ciudadano escriba: es el evento de apertura.
+// Respondemos con el mensaje inicial fijo, sin Claude (0 tokens).
+const TELEGRAM_OPEN_CHAT_RE = /^\/start(?:@\w+)?$/i;
+
 function buildHandoffMessage(escalationContact) {
   if (escalationContact) {
     return `Gracias por tu mensaje. Para resolver tu consulta, por favor llama al ${escalationContact}.`;
   }
   return GENERIC_HANDOFF_MESSAGE;
+}
+
+function isTelegramOpenChat(text) {
+  return TELEGRAM_OPEN_CHAT_RE.test((text || '').trim());
 }
 
 async function handleIncomingMessage(chatId, text) {
@@ -21,6 +33,29 @@ async function handleIncomingMessage(chatId, text) {
     if (!routing) {
       console.error('No se encontró una ruta activa para este bot de Telegram');
       await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE);
+      return;
+    }
+
+    // Apertura del chat: mensaje inicial directo, sin coste de IA.
+    if (isTelegramOpenChat(text)) {
+      console.log('[consulta]', {
+        fecha: new Date().toISOString(),
+        modo: 'fijo',
+        consulta: text,
+        respuesta: WELCOME_MESSAGE,
+        fuente: null,
+        candidatas: [],
+        tokens: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+        coste_usd: 0,
+        modelo: null,
+        motivo: 'apertura_chat',
+      });
+      await telegram.sendMessage(chatId, WELCOME_MESSAGE);
       return;
     }
 
