@@ -40,18 +40,30 @@ async function matchInstructions(agentId, queryText) {
 
 // Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
 // reciente de la conversación, devuelve las instrucciones más relevantes.
-// Primero se prueba con el mensaje tal cual. Si no hay match, el mensaje
-// puede ser una respuesta corta o ambigua fuera de contexto ("el segundo",
-// "el San Roque", "sí") a una pregunta de aclaración que el propio bot
-// acaba de hacer (p. ej. tras detectar varios casos posibles, ver el paso 2
-// de buildFixedSystemPrompt en answer.js): por sí sola no se parece
-// semánticamente a ninguna fila, pero el último mensaje del bot ya contiene
-// los nombres/términos concretos de las opciones. En ese caso se reintenta
-// concatenando ese último mensaje del bot con el mensaje del ciudadano, para
-// que la búsqueda semántica tenga ese contexto disponible.
+//
+// Además de la búsqueda simple (solo el mensaje del ciudadano), si hay un
+// mensaje previo del bot en el historial se hace SIEMPRE también una
+// búsqueda con contexto (ese último mensaje del bot + el mensaje del
+// ciudadano), y se combinan los resultados de ambas. No basta con reintentar
+// con contexto solo cuando la búsqueda simple no encuentra nada: un mensaje
+// de seguimiento corto y genérico ("¿y el teléfono?", "sí", "el segundo")
+// puede SÍ encontrar candidatas por sí solo — p. ej. muchas filas de
+// "teléfono, contacto" de departamentos que no tienen nada que ver — sin que
+// ninguna sea la correcta, y sin encontrar nunca la fila que sí encaja con
+// el contexto real de la conversación (caso real detectado en producción:
+// "¿y el teléfono?" tras preguntar por la dirección del ayuntamiento devolvió
+// diez filas de teléfono de otros departamentos y ninguna del ayuntamiento,
+// y Claude, con esas filas irrelevantes delante y el hilo de la conversación,
+// acabó inventándose un teléfono). Al combinar ambas búsquedas, la fila
+// relevante para el contexto tiene ocasión de aparecer junto a las de la
+// búsqueda simple, en vez de competir a ciegas por las MATCH_COUNT plazas de
+// una sola búsqueda.
+//
+// Si no hay ningún mensaje del bot en el historial (primer mensaje de la
+// conversación), no hay contexto que combinar: se usa solo la búsqueda
+// simple, sin cambios respecto al comportamiento anterior.
 async function getRelevantInstructions(agentId, citizenMessage, history = []) {
   const directMatches = await matchInstructions(agentId, citizenMessage);
-  if (directMatches.length > 0) return directMatches;
 
   let lastBotMessage = null;
   for (let i = history.length - 1; i >= 0; i -= 1) {
@@ -62,7 +74,19 @@ async function getRelevantInstructions(agentId, citizenMessage, history = []) {
   }
   if (!lastBotMessage) return directMatches;
 
-  return matchInstructions(agentId, `${lastBotMessage.content}\n${citizenMessage}`);
+  const contextMatches = await matchInstructions(agentId, `${lastBotMessage.content}\n${citizenMessage}`);
+
+  const bestById = new Map();
+  for (const row of [...directMatches, ...contextMatches]) {
+    const existing = bestById.get(row.id);
+    if (!existing || row.similarity > existing.similarity) {
+      bestById.set(row.id, row);
+    }
+  }
+
+  return [...bestById.values()]
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, MATCH_COUNT);
 }
 
 module.exports = { getRelevantInstructions, SIMILARITY_THRESHOLD };
