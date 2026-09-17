@@ -211,6 +211,17 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   const topInstruction = instructions[0];
   if (topInstruction && topInstruction.response_mode === 'directo') {
     if (topInstruction.similarity >= DIRECT_RESPONSE_THRESHOLD) {
+      // Mismas columnas que la hoja de seguimiento en Drive, solo para el
+      // log de Railway (no escribe en la hoja). Sin Claude: tokens y coste
+      // vacíos.
+      console.log('[consulta-directa]', {
+        fecha: new Date().toISOString(),
+        consulta: citizenMessage,
+        respuesta: topInstruction.instruction,
+        tokens_entrada: '',
+        tokens_salida: '',
+        coste: '',
+      });
       return { needsHuman: false, answer: topInstruction.instruction };
     }
     return { needsHuman: true, answer: null, escalationContact: agent.escalation_contact };
