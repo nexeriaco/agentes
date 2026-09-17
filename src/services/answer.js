@@ -135,8 +135,68 @@ function extractFuente(rawText, instructions, events) {
   };
 }
 
+function formatFuenteLine(fuente) {
+  if (!fuente) return 'ninguna';
+  if (fuente.tabla === 'agent_events') {
+    return `agent_events | ${fuente.title || '(sin título)'} | id=${fuente.id}`;
+  }
+  const sim = fuente.similarity != null ? ` | sim=${fuente.similarity}` : '';
+  const mode = fuente.response_mode ? ` | mode=${fuente.response_mode}` : '';
+  return `agent_instructions | ${fuente.case_group || '?'} › ${fuente.case_subgroup || '?'} | id=${fuente.id}${sim}${mode}`;
+}
+
+function formatCandidatasLines(candidatas) {
+  if (!candidatas || candidatas.length === 0) return ['  (ninguna)'];
+  return candidatas.map((c, i) => {
+    const sim = c.similarity != null ? c.similarity.toFixed(4) : '—.———';
+    return `  ${i + 1}. [${sim}] ${c.case_group || '?'} › ${c.case_subgroup || '?'} | id=${c.id}`;
+  });
+}
+
+function oneLine(text) {
+  if (text == null) return '(vacío)';
+  return String(text).replace(/\s+/g, ' ').trim();
+}
+
+// Un solo console.log por consulta (bloque multilínea) para que en Railway
+// no se mezclen campos de preguntas distintas al pretty-print de objetos.
 function logConsulta(payload) {
-  console.log('[consulta]', payload);
+  const bar = '='.repeat(72);
+  const thin = '-'.repeat(72);
+  const tokens = payload.tokens || emptyUsage();
+  const lines = [
+    bar,
+    `[consulta]  modo=${payload.modo}  |  ${payload.fecha}`,
+    thin,
+    `Consulta:   ${oneLine(payload.consulta)}`,
+    `Respuesta:  ${oneLine(payload.respuesta)}`,
+    thin,
+    `Fuente:     ${formatFuenteLine(payload.fuente)}`,
+  ];
+
+  if (payload.fuente_raw != null) {
+    lines.push(`Fuente raw: ${payload.fuente_raw}`);
+  }
+  if (payload.motivo) {
+    lines.push(`Motivo:     ${payload.motivo}`);
+  }
+
+  lines.push('Candidatas:');
+  lines.push(...formatCandidatasLines(payload.candidatas));
+  lines.push(thin);
+  lines.push(
+    `Tokens:     in=${tokens.input_tokens || 0}  out=${tokens.output_tokens || 0}`
+      + `  cache_w=${tokens.cache_creation_input_tokens || 0}`
+      + `  cache_r=${tokens.cache_read_input_tokens || 0}`
+  );
+  lines.push(
+    `Coste:      $${payload.coste_usd ?? 0}`
+      + `  |  modelo=${payload.modelo || '—'}`
+      + (payload.tool_calls != null ? `  |  tools=${payload.tool_calls}` : '')
+  );
+  lines.push(bar);
+
+  console.log(lines.join('\n'));
 }
 
 function formatDate(isoTimestamp) {
@@ -499,4 +559,4 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   return { needsHuman: false, answer };
 }
 
-module.exports = { generateAnswer, buildFixedSystemPrompt, buildInstructionsPrompt };
+module.exports = { generateAnswer, buildFixedSystemPrompt, buildInstructionsPrompt, logConsulta };

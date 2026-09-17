@@ -1,5 +1,5 @@
 const { getTelegramRouting } = require('../services/routing');
-const { generateAnswer } = require('../services/answer');
+const { generateAnswer, logConsulta } = require('../services/answer');
 const { appendTurn } = require('../services/conversationHistory');
 const telegram = require('./client');
 
@@ -38,7 +38,7 @@ async function handleIncomingMessage(chatId, text) {
 
     // Apertura del chat: mensaje inicial directo, sin coste de IA.
     if (isTelegramOpenChat(text)) {
-      console.log('[consulta]', {
+      logConsulta({
         fecha: new Date().toISOString(),
         modo: 'fijo',
         consulta: text,
