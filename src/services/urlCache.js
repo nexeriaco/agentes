@@ -47,6 +47,25 @@ async function saveToCache(url, content) {
   if (error) throw error;
 }
 
+// La caché solo guarda content; el kind se infiere de los prefijos que
+// escribe urlTool (o de si hay bloques imagen = PDF escaneado).
+function inferKindFromContent(content) {
+  if (!Array.isArray(content) || content.length === 0) return 'link';
+  if (content.some((block) => block.type === 'image')) return 'pdf';
+
+  const text = (content.find((block) => block.type === 'text') || {}).text || '';
+  if (text.startsWith('Texto extraído del PDF') || text.startsWith('El PDF ')) return 'pdf';
+  if (text.startsWith('Contenido de la página')) return 'link';
+  if (
+    text.startsWith('No se pudo')
+    || text.includes('no se puede procesar')
+    || text.includes('No se pudo acceder')
+  ) {
+    return 'error';
+  }
+  return 'link';
+}
+
 // Envoltorio de buscarUrl con caché: si hay una copia guardada de la URL
 // dentro de su tiempo de validez, la devuelve directamente sin volver a
 // consultar la página. Si no, consulta de verdad y guarda el resultado para
@@ -54,7 +73,7 @@ async function saveToCache(url, content) {
 // que ya se obtuvo.
 async function buscarUrlConCache(agentId, url) {
   const cached = await getCachedContent(agentId, url);
-  if (cached) return { content: cached };
+  if (cached) return { content: cached, kind: inferKindFromContent(cached) };
 
   const result = await buscarUrl(url);
   saveToCache(url, result.content).catch((err) => console.error('Error guardando caché de página:', err));

@@ -19,8 +19,9 @@ const convertHtml = compile({
   ],
 });
 
-function textResult(text) {
-  return { content: [{ type: 'text', text }] };
+// kind: 'pdf' | 'link' | 'error' — se propaga al log de consulta.
+function textResult(text, kind = 'link') {
+  return { content: [{ type: 'text', text }], kind };
 }
 
 // Descarga con límite de tamaño y timeout. No lanza por HTTP no-2xx ni por
@@ -68,7 +69,7 @@ async function fetchWithLimit(url) {
 function handleHtml(buffer, url) {
   const text = convertHtml(buffer.toString('utf8'));
   const truncated = text.length > MAX_TEXT_CHARS ? `${text.slice(0, MAX_TEXT_CHARS)}\n[...contenido recortado...]` : text;
-  return textResult(`Contenido de la página ${url}:\n\n${truncated}`);
+  return textResult(`Contenido de la página ${url}:\n\n${truncated}`, 'link');
 }
 
 async function handlePdf(buffer, url) {
@@ -80,7 +81,7 @@ async function handlePdf(buffer, url) {
     if (trimmed.length >= MIN_PDF_TEXT_CHARS) {
       const truncated =
         trimmed.length > MAX_TEXT_CHARS ? `${trimmed.slice(0, MAX_TEXT_CHARS)}\n[...contenido recortado...]` : trimmed;
-      return textResult(`Texto extraído del PDF ${url}:\n\n${truncated}`);
+      return textResult(`Texto extraído del PDF ${url}:\n\n${truncated}`, 'pdf');
     }
 
     // Sin capa de texto (probable escaneo): se renderizan las páginas como
@@ -100,6 +101,7 @@ async function handlePdf(buffer, url) {
     }));
 
     return {
+      kind: 'pdf',
       content: [
         {
           type: 'text',
@@ -122,11 +124,11 @@ async function buscarUrl(url) {
     fetched = await fetchWithLimit(url);
   } catch (err) {
     const reason = err.name === 'AbortError' ? 'se agotó el tiempo de espera' : err.message;
-    return textResult(`No se pudo acceder a la URL ${url}: ${reason}.`);
+    return textResult(`No se pudo acceder a la URL ${url}: ${reason}.`, 'error');
   }
 
   if (fetched.error) {
-    return textResult(fetched.error);
+    return textResult(fetched.error, 'error');
   }
 
   const isPdf = fetched.contentType.includes('application/pdf') || url.toLowerCase().split('?')[0].endsWith('.pdf');
@@ -134,7 +136,7 @@ async function buscarUrl(url) {
   try {
     return isPdf ? await handlePdf(fetched.buffer, url) : handleHtml(fetched.buffer, url);
   } catch (err) {
-    return textResult(`No se pudo procesar el contenido de ${url}: ${err.message}`);
+    return textResult(`No se pudo procesar el contenido de ${url}: ${err.message}`, 'error');
   }
 }
 

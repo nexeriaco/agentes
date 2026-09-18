@@ -158,6 +158,12 @@ function oneLine(text) {
   return String(text).replace(/\s+/g, ' ').trim();
 }
 
+// Lecturas reales vía buscar_url: pdf | link | error; vacío → nada.
+function formatUrlReadsLine(urlReads) {
+  if (!urlReads || urlReads.length === 0) return 'nada';
+  return urlReads.map((r) => `${r.kind || 'link'} | ${r.url}`).join('  ;  ');
+}
+
 // Un solo console.log por consulta (bloque multilínea) para que en Railway
 // no se mezclen campos de preguntas distintas al pretty-print de objetos.
 function logConsulta(payload) {
@@ -172,6 +178,7 @@ function logConsulta(payload) {
     `Respuesta:  ${oneLine(payload.respuesta)}`,
     thin,
     `Fuente:     ${formatFuenteLine(payload.fuente)}`,
+    `Lectura:    ${formatUrlReadsLine(payload.url_reads)}`,
   ];
 
   if (payload.fuente_raw != null) {
@@ -514,6 +521,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   const messages = [...history, { role: 'user', content: citizenMessage }];
   let toolCallCount = 0;
+  const urlReads = [];
   let text = '';
   const usageTotals = emptyUsage();
 
@@ -546,6 +554,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     for (const block of toolUseBlocks) {
       toolCallCount += 1;
       const result = await buscarUrlConCache(agentId, block.input.url);
+      urlReads.push({ url: block.input.url, kind: result.kind || 'link' });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result.content });
     }
     messages.push({ role: 'user', content: toolResults });
@@ -563,10 +572,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       respuesta: HUMAN_HANDOFF_SENTINEL,
       fuente,
       fuente_raw,
+      url_reads: urlReads,
       candidatas: summarizeCandidates(instructions),
       tokens: usageTotals,
       coste_usd: costeUsd,
       modelo: MODEL,
+      tool_calls: toolCallCount,
       motivo: 'sentinel_derivar_a_humano',
     });
     return { needsHuman: true, answer: null, escalationContact: agent.escalation_contact };
@@ -579,6 +590,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     respuesta: answer,
     fuente,
     fuente_raw,
+    url_reads: urlReads,
     candidatas: summarizeCandidates(instructions),
     tokens: usageTotals,
     coste_usd: costeUsd,
