@@ -1,8 +1,10 @@
 const { PDFParse } = require('pdf-parse');
 const { compile } = require('html-to-text');
+const { assertFetchableUrl, UrlGuardError } = require('./urlGuard');
 
 const MAX_BYTES = 20 * 1024 * 1024; // 20MB
 const FETCH_TIMEOUT_MS = 15000;
+const MAX_REDIRECTS = 5;
 // Texto completo guardado en page_cache (antes del rank). Más alto que el
 // techo que ve Claude: así el Ecoparque al final de una home no se pierde.
 const MAX_CACHE_TEXT_CHARS = 200000;
@@ -207,21 +209,7 @@ function unpackFullTextCache(content) {
   return { kind: match[1], url: match[2], fullText: match[3] };
 }
 
-async function fetchWithLimit(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  let response;
-  try {
-    response = await fetch(url, { signal: controller.signal, redirect: 'follow' });
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!response.ok) {
-    return { error: `No se pudo acceder a la URL (HTTP ${response.status}).` };
-  }
-
+async function readResponseBody(response) {
   const declaredLength = Number(response.headers.get('content-length') || 0);
   if (declaredLength > MAX_BYTES) {
     return { error: `El documento supera el tamaño máximo permitido (${Math.round(MAX_BYTES / 1024 / 1024)}MB); no se puede procesar.` };
@@ -244,6 +232,47 @@ async function fetchWithLimit(url) {
   }
 
   return { buffer: Buffer.concat(chunks), contentType };
+}
+
+// Descarga con tope de tamaño/tiempo. Cada hop (URL inicial + redirects) se
+// revalida con la política del turno (B′/B″) y contra destinos privados (C).
+async function fetchWithLimit(url, policy) {
+  let currentUrl = url;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+    await assertFetchableUrl(currentUrl, policy);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    let response;
+    try {
+      response = await fetch(currentUrl, {
+        signal: controller.signal,
+        redirect: 'manual',
+        headers: { Accept: 'text/html,application/pdf,*/*' },
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        return { error: `Redirección sin destino (HTTP ${response.status}).` };
+      }
+      currentUrl = new URL(location, currentUrl).href;
+      continue;
+    }
+
+    if (!response.ok) {
+      return { error: `No se pudo acceder a la URL (HTTP ${response.status}).` };
+    }
+
+    return readResponseBody(response);
+  }
+
+  return { error: `Demasiadas redirecciones (máximo ${MAX_REDIRECTS}).` };
 }
 
 function handleHtml(buffer) {
@@ -292,11 +321,15 @@ async function handlePdf(buffer) {
 
 // Descarga la URL y devuelve texto completo (para caché) o content listo
 // (PDF escaneado / error). No aplica aún el filtro por pregunta.
-async function fetchUrlRaw(url) {
+// `policy` = resultado de buildReadableUrlPolicy (obligatorio para fetch).
+async function fetchUrlRaw(url, policy) {
   let fetched;
   try {
-    fetched = await fetchWithLimit(url);
+    fetched = await fetchWithLimit(url, policy);
   } catch (err) {
+    if (err instanceof UrlGuardError) {
+      return textResult(`No se pudo acceder a la URL ${url}: ${err.message}`, 'error');
+    }
     const reason = err.name === 'AbortError' ? 'se agotó el tiempo de espera' : err.message;
     return textResult(`No se pudo acceder a la URL ${url}: ${reason}.`, 'error');
   }
@@ -337,8 +370,8 @@ function toClaudeResult(url, raw, query) {
 }
 
 // Ejecutor usado por la caché: fetch crudo + empaquetado para page_cache.
-async function buscarUrl(url) {
-  const raw = await fetchUrlRaw(url);
+async function buscarUrl(url, policy) {
+  const raw = await fetchUrlRaw(url, policy);
   if (raw.fullText != null) {
     return {
       kind: raw.kind,

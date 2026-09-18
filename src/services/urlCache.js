@@ -97,11 +97,11 @@ function isLegacyCache(cachedContent) {
 // el filtrado por pregunta (chunk + rank) se aplica al servir, para que
 // distintas consultas sobre la misma página obtengan extractos distintos.
 // Un fallo guardando en caché no debe romper la respuesta ya obtenida.
-async function buscarUrlConCache(agentId, url, query = '') {
+async function buscarUrlConCache(agentId, url, query = '', policy = null) {
   const cached = await getCachedContent(agentId, url);
   if (cached && !isLegacyCache(cached)) return serveFromCache(url, cached, query);
 
-  const result = await buscarUrl(url);
+  const result = await buscarUrl(url, policy);
   // result.content ya viene empaquetado (PAGE_CACHE_V2) o es PDF escaneado/error.
   saveToCache(url, result.content).catch((err) => console.error('Error guardando caché de página:', err));
 

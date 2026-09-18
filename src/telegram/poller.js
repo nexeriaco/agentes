@@ -1,6 +1,8 @@
 const telegram = require('./client');
 const { handleIncomingMessage } = require('./messageHandler');
 
+const MAX_CONCURRENT = 10;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -10,9 +12,30 @@ function sleep(ms) {
 // de Telegram, igual que WhatsApp.
 async function startPolling() {
   await telegram.deleteWebhook();
-  console.log('Telegram: polling activo (webhook eliminado)');
+  console.log(`Telegram: polling activo (webhook eliminado), máx. ${MAX_CONCURRENT} en paralelo`);
 
   let offset = 0;
+  let inFlight = 0;
+  const waiters = [];
+
+  function acquireSlot() {
+    if (inFlight < MAX_CONCURRENT) {
+      inFlight += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      waiters.push(() => {
+        inFlight += 1;
+        resolve();
+      });
+    });
+  }
+
+  function releaseSlot() {
+    inFlight -= 1;
+    const next = waiters.shift();
+    if (next) next();
+  }
 
   while (true) {
     try {
@@ -22,9 +45,20 @@ async function startPolling() {
         offset = update.update_id + 1;
 
         const message = update.message;
-        if (message && message.text) {
-          await handleIncomingMessage(message.chat.id, message.text);
-        }
+        if (!(message && message.text)) continue;
+
+        const chatId = message.chat.id;
+        const text = message.text;
+
+        // No await en serie: hasta MAX_CONCURRENT handlers a la vez.
+        acquireSlot()
+          .then(() => handleIncomingMessage(chatId, text))
+          .catch((err) => {
+            console.error('Error procesando update de Telegram:', err);
+          })
+          .finally(() => {
+            releaseSlot();
+          });
       }
     } catch (err) {
       console.error('Error en el polling de Telegram:', err);
@@ -33,4 +67,4 @@ async function startPolling() {
   }
 }
 
-module.exports = { startPolling };
+module.exports = { startPolling, MAX_CONCURRENT };

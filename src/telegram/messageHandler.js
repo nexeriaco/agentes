@@ -1,6 +1,7 @@
 const { getTelegramRouting } = require('../services/routing');
 const { generateAnswer, logConsulta } = require('../services/answer');
 const { appendTurn } = require('../services/conversationHistory');
+const { checkChatRateLimit } = require('../services/chatRateLimit');
 const telegram = require('./client');
 
 // Se usa cuando no hay un escalation_contact configurado para el agente
@@ -10,6 +11,14 @@ const GENERIC_HANDOFF_MESSAGE =
 
 const WELCOME_MESSAGE =
   '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información que necesites.';
+
+const MAX_MESSAGE_CHARS = 300;
+
+const TOO_LONG_MESSAGE =
+  'Tu mensaje es demasiado largo. Por favor, resume tu consulta en menos de 300 caracteres.';
+
+const RATE_LIMIT_MESSAGE =
+  'Has enviado demasiados mensajes en poco tiempo. Espera unos minutos e inténtalo de nuevo.';
 
 // Al abrir el bot, Telegram envía solo "/start" (o "/start@nombre_bot").
 // No es un comando que el ciudadano escriba: es el evento de apertura.
@@ -29,19 +38,21 @@ function isTelegramOpenChat(text) {
 
 async function handleIncomingMessage(chatId, text) {
   try {
-    const routing = await getTelegramRouting(telegram.getBotId());
-    if (!routing) {
-      console.error('No se encontró una ruta activa para este bot de Telegram');
-      await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE);
-      return;
-    }
+    const trimmed = (text || '').trim();
 
-    // Apertura del chat: mensaje inicial directo, sin coste de IA.
-    if (isTelegramOpenChat(text)) {
+    // /start: sin rate limit ni tope de longitud (evento de apertura).
+    if (isTelegramOpenChat(trimmed)) {
+      const routing = await getTelegramRouting(telegram.getBotId());
+      if (!routing) {
+        console.error('No se encontró una ruta activa para este bot de Telegram');
+        await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE);
+        return;
+      }
+
       logConsulta({
         fecha: new Date().toISOString(),
         modo: 'fijo',
-        consulta: text,
+        consulta: trimmed,
         respuesta: WELCOME_MESSAGE,
         fuente: null,
         candidatas: [],
@@ -59,7 +70,32 @@ async function handleIncomingMessage(chatId, text) {
       return;
     }
 
-    const { needsHuman, answer, escalationContact } = await generateAnswer(text, routing.agentId, chatId);
+    if (trimmed.length > MAX_MESSAGE_CHARS) {
+      await telegram.sendMessage(chatId, TOO_LONG_MESSAGE);
+      return;
+    }
+
+    const rate = checkChatRateLimit(chatId, trimmed);
+    if (!rate.allowed) {
+      if (rate.reason === 'rate_limit') {
+        await telegram.sendMessage(chatId, RATE_LIMIT_MESSAGE);
+      }
+      // duplicate: silencio (mismo texto al instante)
+      return;
+    }
+
+    const routing = await getTelegramRouting(telegram.getBotId());
+    if (!routing) {
+      console.error('No se encontró una ruta activa para este bot de Telegram');
+      await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE);
+      return;
+    }
+
+    const { needsHuman, answer, escalationContact } = await generateAnswer(
+      trimmed,
+      routing.agentId,
+      chatId
+    );
     const finalText = needsHuman ? buildHandoffMessage(escalationContact) : answer;
 
     await telegram.sendMessage(chatId, finalText);
@@ -67,7 +103,7 @@ async function handleIncomingMessage(chatId, text) {
     // El guardado del historial no debe romper la respuesta ya enviada:
     // si Supabase falla aquí, se pierde memoria de este turno pero el
     // ciudadano ya recibió su respuesta con normalidad.
-    await appendTurn(routing.agentId, chatId, text, finalText).catch((err) =>
+    await appendTurn(routing.agentId, chatId, trimmed, finalText).catch((err) =>
       console.error('Error guardando historial de conversación:', err)
     );
   } catch (err) {
@@ -76,4 +112,4 @@ async function handleIncomingMessage(chatId, text) {
   }
 }
 
-module.exports = { handleIncomingMessage };
+module.exports = { handleIncomingMessage, MAX_MESSAGE_CHARS };

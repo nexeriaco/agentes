@@ -4,6 +4,7 @@ const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
 const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
 const { buscarUrlConCache } = require('./urlCache');
+const { buildReadableUrlPolicy, isUrlAllowedByPolicy } = require('./urlGuard');
 const { getRecentHistory } = require('./conversationHistory');
 
 const MODEL = 'claude-haiku-4-5';
@@ -284,15 +285,6 @@ function buildFixedSystemPrompt(agent, events, today) {
     ? agent.tone_instructions
     : '(sin instrucciones de tono adicionales)';
 
-  const escalationBlock = agent.escalation_contact
-    ? `<internal_only>
-Contacto de escalación interno: ${agent.escalation_contact}.
-Nunca lo menciones, sugieras ni escribas en la respuesta al ciudadano.
-</internal_only>
-
-`
-    : '';
-
   return `<role>
 Eres el asistente virtual de un ayuntamiento. Hoy es ${today}.
 Respondes a ciudadanos por chat: cercano, breve y en texto plano.
@@ -329,7 +321,7 @@ No uses buscar_url si la pregunta solo pide un dato de contacto (teléfono, emai
 ${tone}
 </tone>
 
-${escalationBlock}<intent>
+<intent>
 Los subtemas de los casos suelen ir prefijados. Úsalos para elegir bien:
 - CONTACTO · → teléfono, email, dirección, horario de atención, redes.
 - TRÁMITE · → cómo hacer algo, cita, app, enlace de gestión, requisitos, reserva.
@@ -529,8 +521,8 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       text: buildInstructionsPrompt(instructions),
     },
   ];
-  const hasReadableUrls =
-    instructions.some((instr) => instr.allow_url_reading) || events.some((ev) => ev.allow_url_reading);
+  const urlPolicy = buildReadableUrlPolicy(instructions, events);
+  const hasReadableUrls = urlPolicy.exactUrls.size > 0;
 
   const messages = [...history, { role: 'user', content: citizenMessage }];
   let toolCallCount = 0;
@@ -566,8 +558,20 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     const toolResults = [];
     for (const block of toolUseBlocks) {
       toolCallCount += 1;
-      const result = await buscarUrlConCache(agentId, block.input.url, citizenMessage);
-      urlReads.push({ url: block.input.url, kind: result.kind || 'link' });
+      const requestedUrl = block.input && block.input.url;
+      let result;
+      if (!isUrlAllowedByPolicy(requestedUrl, urlPolicy)) {
+        result = {
+          kind: 'error',
+          content: [{
+            type: 'text',
+            text: `URL no permitida: solo se pueden abrir URLs asociadas a un caso o evento de este turno (o un documento del mismo sitio).`,
+          }],
+        };
+      } else {
+        result = await buscarUrlConCache(agentId, requestedUrl, citizenMessage, urlPolicy);
+      }
+      urlReads.push({ url: requestedUrl, kind: result.kind || 'link' });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result.content });
     }
     messages.push({ role: 'user', content: toolResults });
