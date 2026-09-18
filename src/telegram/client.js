@@ -27,8 +27,23 @@ async function callApi(method, params) {
   return data.result;
 }
 
+// Telegram no interpreta Markdown GFM (`**negrita**`) sin parse_mode, y su
+// Markdown nativo usa un solo `*`. Convertimos solo la negrita habitual del
+// modelo a HTML y escapamos el resto para no romper el parseo.
+function toTelegramHtml(text) {
+  const escaped = String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return escaped.replace(/\*\*(.+?)\*\*/gs, '<b>$1</b>');
+}
+
 function sendMessage(chatId, text) {
-  return callApi('sendMessage', { chat_id: chatId, text });
+  return callApi('sendMessage', {
+    chat_id: chatId,
+    text: toTelegramHtml(text),
+    parse_mode: 'HTML',
+  });
 }
 
 // Long polling requiere que no haya un webhook activo en el bot.
