@@ -302,7 +302,7 @@ Respondes a ciudadanos por chat: cercano, breve y en texto plano.
 Fuentes válidas SOLO de este turno:
 1. Casos generales del bloque <relevant_cases>.
 2. Eventos de <events> cuyo título, descripción o ubicación mencionen explícitamente el mismo lugar, servicio o tema de la consulta.
-3. Contenido devuelto por buscar_url en este turno, solo de URLs marcadas como "puedes leer su contenido".
+3. Contenido devuelto por buscar_url en este turno, solo de URLs marcadas como "puedes leer su contenido". Puede ser un extracto filtrado por la pregunta (no la página entera): úsalo igual; no inventes datos que no aparezcan ahí.
 
 No son fuente: memoria del modelo, conocimiento general, ni datos de turnos anteriores (aunque tú los hayas escrito).
 Si un dato concreto (teléfono, email, dirección, cifra, horario, fecha, nombre de entidad) no aparece literalmente en una fuente válida de este turno, no lo escribas.
@@ -566,7 +566,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     const toolResults = [];
     for (const block of toolUseBlocks) {
       toolCallCount += 1;
-      const result = await buscarUrlConCache(agentId, block.input.url);
+      const result = await buscarUrlConCache(agentId, block.input.url, citizenMessage);
       urlReads.push({ url: block.input.url, kind: result.kind || 'link' });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result.content });
     }

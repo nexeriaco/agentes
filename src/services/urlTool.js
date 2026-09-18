@@ -3,9 +3,17 @@ const { compile } = require('html-to-text');
 
 const MAX_BYTES = 20 * 1024 * 1024; // 20MB
 const FETCH_TIMEOUT_MS = 15000;
-const MAX_TEXT_CHARS = 15000; // recorte de texto devuelto a Claude (página o PDF)
-const MIN_PDF_TEXT_CHARS = 40; // por debajo de esto, se asume PDF escaneado sin capa de texto
+// Texto completo guardado en page_cache (antes del rank). Más alto que el
+// techo que ve Claude: así el Ecoparque al final de una home no se pierde.
+const MAX_CACHE_TEXT_CHARS = 200000;
+// Extracto máximo que se envía a Claude tras chunk + rank.
+const MAX_RETURN_CHARS = 4000;
+const TARGET_CHUNK_CHARS = 400;
+const TOP_CHUNKS = 5;
+const MIN_PDF_TEXT_CHARS = 40;
 const MAX_SCREENSHOT_PAGES = 8;
+
+const CACHE_V2_PREFIX = 'PAGE_CACHE_V2';
 
 const convertHtml = compile({
   wordwrap: false,
@@ -19,14 +27,186 @@ const convertHtml = compile({
   ],
 });
 
-// kind: 'pdf' | 'link' | 'error' — se propaga al log de consulta.
 function textResult(text, kind = 'link') {
   return { content: [{ type: 'text', text }], kind };
 }
 
-// Descarga con límite de tamaño y timeout. No lanza por HTTP no-2xx ni por
-// exceso de tamaño: en ambos casos devuelve { error } para que el llamador
-// lo convierta en un tool_result explicativo en vez de romper el flujo.
+function clipForCache(text) {
+  if (text.length <= MAX_CACHE_TEXT_CHARS) return text;
+  return `${text.slice(0, MAX_CACHE_TEXT_CHARS)}\n[...contenido recortado para caché...]`;
+}
+
+function tokenize(text) {
+  return String(text)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((t) => t.length > 2);
+}
+
+function splitIntoChunks(text) {
+  const paragraphs = String(text)
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length === 0) {
+    const t = String(text).trim();
+    return t ? [t] : [];
+  }
+
+  const chunks = [];
+  let buf = '';
+
+  for (const p of paragraphs) {
+    if (!buf) {
+      buf = p;
+      continue;
+    }
+    if (buf.length + p.length + 2 <= TARGET_CHUNK_CHARS * 1.5) {
+      buf = `${buf}\n\n${p}`;
+      continue;
+    }
+    chunks.push(buf);
+    if (p.length > TARGET_CHUNK_CHARS * 2) {
+      for (let i = 0; i < p.length; i += TARGET_CHUNK_CHARS) {
+        chunks.push(p.slice(i, i + TARGET_CHUNK_CHARS));
+      }
+      buf = '';
+    } else {
+      buf = p;
+    }
+  }
+  if (buf) chunks.push(buf);
+  return chunks;
+}
+
+function scoreChunk(chunk, queryTokens) {
+  const normalized = chunk
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '');
+  let score = 0;
+  for (const token of queryTokens) {
+    if (normalized.includes(token)) score += 1;
+  }
+  // Ligero empujón a trozos con enlaces (trámites que necesitan el href).
+  if (/https?:\/\//i.test(chunk)) score += 0.25;
+  return score;
+}
+
+// Elige los trozos más alineados con la pregunta. Si la query no aporta
+// tokens o ningún chunk puntúa, cae al inicio del documento (comportamiento
+// previo). Conserva vecinos con http junto a chunks buenos.
+function selectRelevantExtracts(fullText, query) {
+  const text = String(fullText || '');
+  if (!text) return '';
+
+  const queryTokens = [...new Set(tokenize(query || ''))];
+  if (queryTokens.length === 0) {
+    return text.length > MAX_RETURN_CHARS
+      ? `${text.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`
+      : text;
+  }
+
+  const chunks = splitIntoChunks(text);
+  if (chunks.length === 0) return '';
+
+  const scored = chunks.map((chunk, index) => ({
+    chunk,
+    index,
+    score: scoreChunk(chunk, queryTokens),
+  }));
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const selectedIndexes = new Set();
+  let usedChars = 0;
+
+  for (const item of scored) {
+    if (item.score <= 0) break;
+    if (selectedIndexes.size >= TOP_CHUNKS) break;
+
+    const candidates = [item.index];
+    if (item.index > 0 && /https?:\/\//i.test(chunks[item.index - 1])) {
+      candidates.unshift(item.index - 1);
+    }
+    if (item.index < chunks.length - 1 && /https?:\/\//i.test(chunks[item.index + 1])) {
+      candidates.push(item.index + 1);
+    }
+
+    for (const idx of candidates) {
+      if (selectedIndexes.has(idx)) continue;
+      const nextLen = chunks[idx].length + (usedChars > 0 ? 2 : 0);
+      if (usedChars + nextLen > MAX_RETURN_CHARS && selectedIndexes.size > 0) continue;
+      selectedIndexes.add(idx);
+      usedChars += nextLen;
+      if (selectedIndexes.size >= TOP_CHUNKS + 2) break;
+    }
+  }
+
+  if (selectedIndexes.size === 0) {
+    return text.length > MAX_RETURN_CHARS
+      ? `${text.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`
+      : text;
+  }
+
+  const ordered = [...selectedIndexes].sort((a, b) => a - b);
+  let extract = ordered.map((i) => chunks[i]).join('\n\n---\n\n');
+  if (extract.length > MAX_RETURN_CHARS) {
+    extract = `${extract.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`;
+  }
+  return extract;
+}
+
+function buildClaudeText(url, kind, fullText, query) {
+  const extract = selectRelevantExtracts(fullText, query);
+  const header =
+    kind === 'pdf'
+      ? `Extractos relevantes del PDF ${url}`
+      : `Extractos relevantes de la página ${url}`;
+  const queryNote = query && String(query).trim()
+    ? ` para la consulta: ${String(query).trim()}`
+    : '';
+  return `${header}${queryNote}:\n\n${extract}`;
+}
+
+function packFullTextCache(url, kind, fullText) {
+  return [
+    {
+      type: 'text',
+      text: `${CACHE_V2_PREFIX}\nkind: ${kind}\nurl: ${url}\n\n${fullText}`,
+    },
+  ];
+}
+
+function unpackFullTextCache(content) {
+  if (!Array.isArray(content) || content.length === 0) return null;
+  if (content.some((block) => block.type === 'image')) {
+    return { kind: 'pdf', content };
+  }
+
+  const text = (content.find((block) => block.type === 'text') || {}).text || '';
+  if (!text.startsWith(CACHE_V2_PREFIX)) {
+    // Caché antigua (ya truncada): se puede re-rankear sobre lo que haya.
+    let kind = 'link';
+    if (text.startsWith('Texto extraído del PDF') || text.startsWith('El PDF ')) kind = 'pdf';
+    if (
+      text.startsWith('No se pudo')
+      || text.includes('no se puede procesar')
+      || text.includes('No se pudo acceder')
+    ) {
+      return { kind: 'error', content };
+    }
+    const bodyMatch = text.match(/\n\n([\s\S]*)$/);
+    return { kind, fullText: bodyMatch ? bodyMatch[1] : text, legacy: true };
+  }
+
+  const match = text.match(/^PAGE_CACHE_V2\nkind: (\w+)\nurl: (.+)\n\n([\s\S]*)$/);
+  if (!match) return { kind: 'link', fullText: text };
+  return { kind: match[1], url: match[2], fullText: match[3] };
+}
+
 async function fetchWithLimit(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -66,26 +246,21 @@ async function fetchWithLimit(url) {
   return { buffer: Buffer.concat(chunks), contentType };
 }
 
-function handleHtml(buffer, url) {
-  const text = convertHtml(buffer.toString('utf8'));
-  const truncated = text.length > MAX_TEXT_CHARS ? `${text.slice(0, MAX_TEXT_CHARS)}\n[...contenido recortado...]` : text;
-  return textResult(`Contenido de la página ${url}:\n\n${truncated}`, 'link');
+function handleHtml(buffer) {
+  const fullText = clipForCache(convertHtml(buffer.toString('utf8')));
+  return { kind: 'link', fullText };
 }
 
-async function handlePdf(buffer, url) {
+async function handlePdf(buffer) {
   const parser = new PDFParse({ data: buffer });
   try {
     const { text } = await parser.getText();
     const trimmed = (text || '').trim();
 
     if (trimmed.length >= MIN_PDF_TEXT_CHARS) {
-      const truncated =
-        trimmed.length > MAX_TEXT_CHARS ? `${trimmed.slice(0, MAX_TEXT_CHARS)}\n[...contenido recortado...]` : trimmed;
-      return textResult(`Texto extraído del PDF ${url}:\n\n${truncated}`, 'pdf');
+      return { kind: 'pdf', fullText: clipForCache(trimmed) };
     }
 
-    // Sin capa de texto (probable escaneo): se renderizan las páginas como
-    // imágenes para que Claude las lea visualmente.
     const info = await parser.getInfo();
     const totalPages = info.total || 1;
     const lastPage = Math.min(totalPages, MAX_SCREENSHOT_PAGES);
@@ -105,7 +280,7 @@ async function handlePdf(buffer, url) {
       content: [
         {
           type: 'text',
-          text: `El PDF ${url} no tiene texto extraíble (parece un documento escaneado). Aquí tienes sus páginas (${imageBlocks.length} de ${totalPages}) como imágenes para que las leas visualmente:`,
+          text: `El PDF no tiene texto extraíble (parece un documento escaneado). Aquí tienes sus páginas (${imageBlocks.length} de ${totalPages}) como imágenes para que las leas visualmente:`,
         },
         ...imageBlocks,
       ],
@@ -115,10 +290,9 @@ async function handlePdf(buffer, url) {
   }
 }
 
-// Ejecutor real de la tool "buscar_url": descarga la URL y devuelve su
-// contenido en el formato que espera un tool_result de la API de Anthropic.
-// Nunca lanza: cualquier fallo se traduce en un bloque de texto explicativo.
-async function buscarUrl(url) {
+// Descarga la URL y devuelve texto completo (para caché) o content listo
+// (PDF escaneado / error). No aplica aún el filtro por pregunta.
+async function fetchUrlRaw(url) {
   let fetched;
   try {
     fetched = await fetchWithLimit(url);
@@ -131,13 +305,57 @@ async function buscarUrl(url) {
     return textResult(fetched.error, 'error');
   }
 
-  const isPdf = fetched.contentType.includes('application/pdf') || url.toLowerCase().split('?')[0].endsWith('.pdf');
+  const isPdf =
+    fetched.contentType.includes('application/pdf') || url.toLowerCase().split('?')[0].endsWith('.pdf');
 
   try {
-    return isPdf ? await handlePdf(fetched.buffer, url) : handleHtml(fetched.buffer, url);
+    return isPdf ? await handlePdf(fetched.buffer) : handleHtml(fetched.buffer);
   } catch (err) {
     return textResult(`No se pudo procesar el contenido de ${url}: ${err.message}`, 'error');
   }
 }
 
-module.exports = { buscarUrl };
+function toClaudeResult(url, raw, query) {
+  if (raw.content && !raw.fullText) {
+    // error o PDF escaneado: sin rank
+    if (raw.kind === 'pdf' && Array.isArray(raw.content)) {
+      const header = raw.content[0];
+      if (header && header.type === 'text' && header.text.startsWith('El PDF no tiene')) {
+        return {
+          kind: raw.kind,
+          content: [
+            { type: 'text', text: header.text.replace('El PDF no tiene', `El PDF ${url} no tiene`) },
+            ...raw.content.slice(1),
+          ],
+        };
+      }
+    }
+    return { kind: raw.kind, content: raw.content };
+  }
+
+  return textResult(buildClaudeText(url, raw.kind || 'link', raw.fullText, query), raw.kind || 'link');
+}
+
+// Ejecutor usado por la caché: fetch crudo + empaquetado para page_cache.
+async function buscarUrl(url) {
+  const raw = await fetchUrlRaw(url);
+  if (raw.fullText != null) {
+    return {
+      kind: raw.kind,
+      fullText: raw.fullText,
+      content: packFullTextCache(url, raw.kind, raw.fullText),
+    };
+  }
+  return raw;
+}
+
+module.exports = {
+  buscarUrl,
+  fetchUrlRaw,
+  toClaudeResult,
+  unpackFullTextCache,
+  packFullTextCache,
+  selectRelevantExtracts,
+  buildClaudeText,
+  CACHE_V2_PREFIX,
+};

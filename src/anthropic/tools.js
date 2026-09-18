@@ -5,7 +5,9 @@ const BUSCAR_URL_TOOL = {
   name: 'buscar_url',
   description:
     'Descarga y devuelve el contenido de una URL pública (página web o documento PDF). ' +
-    'Si es una página web, devuelve su texto legible con los enlaces marcados entre corchetes ' +
+    'En páginas o PDFs largos puede devolver extractos filtrados según la pregunta del ciudadano ' +
+    '(no necesariamente el documento entero); úsalos igual para responder. ' +
+    'Si es una página web, el texto incluye los enlaces marcados entre corchetes ' +
     'justo en el punto del texto donde aparecen, para poder identificar cuál corresponde a qué ' +
     'tema o documento. Si es un PDF, devuelve el texto extraído del documento; si el PDF no tiene ' +
     'texto extraíble (por ejemplo, por ser un escaneo), devuelve sus páginas como imágenes para que ' +

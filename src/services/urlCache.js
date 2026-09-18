@@ -1,5 +1,9 @@
 const supabase = require('../supabase/client');
-const { buscarUrl } = require('./urlTool');
+const {
+  buscarUrl,
+  toClaudeResult,
+  unpackFullTextCache,
+} = require('./urlTool');
 
 // Tiempo de validez por defecto cuando la fila de agent_instructions no
 // especifica horas_cache_pagina (o la URL no corresponde a ninguna fila,
@@ -47,15 +51,16 @@ async function saveToCache(url, content) {
   if (error) throw error;
 }
 
-// La caché solo guarda content; el kind se infiere de los prefijos que
-// escribe urlTool (o de si hay bloques imagen = PDF escaneado).
 function inferKindFromContent(content) {
   if (!Array.isArray(content) || content.length === 0) return 'link';
   if (content.some((block) => block.type === 'image')) return 'pdf';
 
+  const unpacked = unpackFullTextCache(content);
+  if (unpacked && unpacked.kind) return unpacked.kind;
+
   const text = (content.find((block) => block.type === 'text') || {}).text || '';
   if (text.startsWith('Texto extraído del PDF') || text.startsWith('El PDF ')) return 'pdf';
-  if (text.startsWith('Contenido de la página')) return 'link';
+  if (text.startsWith('Contenido de la página') || text.startsWith('Extractos relevantes')) return 'link';
   if (
     text.startsWith('No se pudo')
     || text.includes('no se puede procesar')
@@ -66,18 +71,44 @@ function inferKindFromContent(content) {
   return 'link';
 }
 
-// Envoltorio de buscarUrl con caché: si hay una copia guardada de la URL
-// dentro de su tiempo de validez, la devuelve directamente sin volver a
-// consultar la página. Si no, consulta de verdad y guarda el resultado para
-// la próxima vez. Un fallo guardando en caché no debe romper la respuesta
-// que ya se obtuvo.
-async function buscarUrlConCache(agentId, url) {
+// Aplica chunk+rank sobre una entrada de caché (V2 o legacy) y construye
+// el tool_result que verá Claude. query es la pregunta del ciudadano.
+function serveFromCache(url, cachedContent, query) {
+  const unpacked = unpackFullTextCache(cachedContent);
+  if (!unpacked) {
+    return { content: cachedContent, kind: inferKindFromContent(cachedContent) };
+  }
+
+  if (unpacked.content && !unpacked.fullText) {
+    return { content: unpacked.content, kind: unpacked.kind || 'pdf' };
+  }
+
+  return toClaudeResult(url, { kind: unpacked.kind || 'link', fullText: unpacked.fullText }, query);
+}
+
+// true si la entrada es del formato anterior (ya truncada a ~15k): forzamos
+// refetch para rellenar PAGE_CACHE_V2 con el texto completo.
+function isLegacyCache(cachedContent) {
+  const unpacked = unpackFullTextCache(cachedContent);
+  return Boolean(unpacked && unpacked.legacy);
+}
+
+// Envoltorio de buscarUrl con caché: guarda el texto COMPLETO de la URL;
+// el filtrado por pregunta (chunk + rank) se aplica al servir, para que
+// distintas consultas sobre la misma página obtengan extractos distintos.
+// Un fallo guardando en caché no debe romper la respuesta ya obtenida.
+async function buscarUrlConCache(agentId, url, query = '') {
   const cached = await getCachedContent(agentId, url);
-  if (cached) return { content: cached, kind: inferKindFromContent(cached) };
+  if (cached && !isLegacyCache(cached)) return serveFromCache(url, cached, query);
 
   const result = await buscarUrl(url);
+  // result.content ya viene empaquetado (PAGE_CACHE_V2) o es PDF escaneado/error.
   saveToCache(url, result.content).catch((err) => console.error('Error guardando caché de página:', err));
-  return result;
+
+  if (result.fullText != null) {
+    return toClaudeResult(url, { kind: result.kind, fullText: result.fullText }, query);
+  }
+  return { content: result.content, kind: result.kind || 'link' };
 }
 
 module.exports = { buscarUrlConCache };
