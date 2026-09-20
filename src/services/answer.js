@@ -39,6 +39,11 @@ const DIRECT_RESPONSE_MARGIN = 0.03;
 // en los dos puntos marcados abajo en vez de solo devolver needsHuman: true.
 const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
 
+// Teléfono general del Ayuntamiento en data/original (directorio / página
+// principal). Se usa cuando un documento abierto no trae el dato pedido.
+// Si el agente tiene escalation_contact, ese valor tiene prioridad.
+const DEFAULT_AYUNTAMIENTO_PHONE = '968 620 022';
+
 // Precio Claude Haiku 4.5 (USD / millón de tokens). Caché = ephemeral 5 min.
 const HAIKU_USD_PER_MTOK = {
   input: 1.0,
@@ -285,6 +290,8 @@ function buildFixedSystemPrompt(agent, events, today) {
     ? agent.tone_instructions
     : '(sin instrucciones de tono adicionales)';
 
+  const ayuntamientoPhone = (agent.escalation_contact || DEFAULT_AYUNTAMIENTO_PHONE).trim();
+
   // Prompt fijo acortado: una sola cascada de tools, reglas sin duplicar
   // task/examples, e historial aclarado (contexto sí, hechos nuevos no).
   return `<role>
@@ -318,10 +325,17 @@ Cascada (no saltes):
 1. Texto del caso/evento si ya cubre la pregunta.
 2. Si falta info y la URL es legible → buscar_url en esa página/PDF.
 3. Si en el resultado aparece un PDF/doc concreto relacionado → segunda llamada con esa URL exacta (nunca inventada).
-4. Si aún no hay base → <fallback>.
+4. Si aún no hay base → aplica <doc_miss> o <fallback> según el caso.
 PDF con texto → usa el texto. PDF escaneado (imágenes) → léelo; no digas al ciudadano que es un escaneo.
 No abras URL/PDF solo para un contacto (teléfono, email, dirección, horario) si ya hay un caso CONTACTO con ese dato.
 </tools>
+
+<doc_miss>
+Tras abrir un documento/página de este turno:
+A) El dato pedido NO aparece en el extracto → NO uses ${HUMAN_HANDOFF_SENTINEL}. Responde en una o dos frases naturales: que no has encontrado esa información en el documento consultado, y que puede llamar al Ayuntamiento al ${ayuntamientoPhone}. Cierra con FUENTE:ninguna (o el ID del caso del documento si lo usaste).
+B) El texto remite a OTRO archivo/ordenanza/PDF (por nombre o URL) → dilo con claridad al ciudadano (nombre del documento y URL si aparece literal en la fuente). Si esa URL exacta está entre las legibles de este turno, ábrela con buscar_url. Si no puedes abrirla en este turno, indica el archivo/enlace y, si aún falta el dato, añade que puede llamar al ${ayuntamientoPhone}.
+No inventes nombres ni URLs de documentos que no salgan en las fuentes de este turno.
+</doc_miss>
 
 <intent>
 Prefijos de subtema:
@@ -352,7 +366,7 @@ Si hay tipos distintos y la pregunta es ambigua ("basuras", "terraza", "perro"),
 </output>
 
 <fallback>
-Sin caso/evento aplicable o falta el dato pedido en las fuentes de este turno:
+Sin caso/evento aplicable en absoluto (no has llegado a abrir un documento útil):
 ${HUMAN_HANDOFF_SENTINEL}
 FUENTE:ninguna
 </fallback>
@@ -383,13 +397,25 @@ FUENTE:ninguna</assistant>
 <assistant>(frase natural con el dato tal cual)
 FUENTE:(id del caso)</assistant>
 </example>
+
+<example>
+<user>Abriste un PDF y el dato pedido no está en el extracto</user>
+<assistant>He consultado el documento disponible, pero no aparece esa información. Puedes llamar al Ayuntamiento al ${ayuntamientoPhone}.
+FUENTE:ninguna</assistant>
+</example>
+
+<example>
+<user>El PDF remite a otra ordenanza o archivo por nombre o URL</user>
+<assistant>En ese documento se remite a (nombre del otro archivo). Puedes consultarlo aquí: (URL exacta si aparece en la fuente).
+FUENTE:(id del caso leído)</assistant>
+</example>
 </examples>
 
 <task>
 1. Intención y caso según <intent> (interno; no etiquetes en la respuesta).
 2. Eventos según <rules>; cascada <tools>.
-3. Respuesta <output> o <fallback>; avisa año si aplica (regla 6).
-4. Cierra siempre con FUENTE:...
+3. Si abriste un doc y falta el dato o remite a otro archivo → <doc_miss>. Si no hay caso/evento → <fallback>.
+4. Respuesta <output>; avisa año si aplica (regla 6). Cierra siempre con FUENTE:...
 </task>`;
 }
 
@@ -551,7 +577,14 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   const { answer, fuente, fuente_raw } = extractFuente(text, instructions, events);
   const costeUsd = calculateHaikuCostUsd(usageTotals);
 
-  if (answer === HUMAN_HANDOFF_SENTINEL || text === HUMAN_HANDOFF_SENTINEL) {
+  // Handoff si la respuesta (o el texto crudo) es solo el sentinel, o si lo
+  // incluye como marcador (p. ej. explicación + DERIVAR_A_HUMANO).
+  const answerIsHandoff = answer === HUMAN_HANDOFF_SENTINEL
+    || text === HUMAN_HANDOFF_SENTINEL
+    || new RegExp(`(^|\\n)\\s*${HUMAN_HANDOFF_SENTINEL}\\s*($|\\n)`, 'i').test(answer)
+    || new RegExp(`(^|\\n)\\s*${HUMAN_HANDOFF_SENTINEL}\\s*($|\\n)`, 'i').test(text);
+
+  if (answerIsHandoff) {
     // TODO: derivar a un humano.
     logConsulta({
       fecha: new Date().toISOString(),

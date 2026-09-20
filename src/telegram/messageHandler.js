@@ -9,6 +9,8 @@ const telegram = require('./client');
 const GENERIC_HANDOFF_MESSAGE =
   'Gracias por tu mensaje. Un miembro de nuestro equipo se pondrá en contacto contigo en breve.';
 
+const DEFAULT_AYUNTAMIENTO_PHONE = '968 620 022';
+
 const WELCOME_MESSAGE =
   '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información que necesites.';
 
@@ -26,8 +28,9 @@ const RATE_LIMIT_MESSAGE =
 const TELEGRAM_OPEN_CHAT_RE = /^\/start(?:@\w+)?$/i;
 
 function buildHandoffMessage(escalationContact) {
-  if (escalationContact) {
-    return `Gracias por tu mensaje. Para resolver tu consulta, por favor llama al ${escalationContact}.`;
+  const phone = (escalationContact || DEFAULT_AYUNTAMIENTO_PHONE).trim();
+  if (phone) {
+    return `Gracias por tu mensaje. Para resolver tu consulta, por favor llama al Ayuntamiento al ${phone}.`;
   }
   return GENERIC_HANDOFF_MESSAGE;
 }
