@@ -22,15 +22,17 @@ const MAX_TOOL_CALLS = 4;
 // reales, igual que se calibró el 0.4 general.
 const DIRECT_RESPONSE_THRESHOLD = 0.55;
 
-// Margen mínimo de separación (similitud coseno) que debe sacar la mejor
-// candidata a la segunda para responder en 'directo' sin pasar por Claude.
-// Si dos o más casos quedan casi empatados, es señal de ambigüedad real
-// (típico de grupos de filas muy parecidas entre sí, como "teléfono de
-// [departamento]" repetido por concejalía) y ganar por decimales no es
-// garantía suficiente de haber acertado la fila correcta. Punto de partida
-// a calibrar con datos reales, igual que SIMILARITY_THRESHOLD y
-// DIRECT_RESPONSE_THRESHOLD.
-const DIRECT_RESPONSE_MARGIN = 0.03;
+// Cuántas candidatas (ya ordenadas por similitud) se miran para un atajo
+// 'directo'. Así una ficha FAQ correcta en 2.º/3.º no pierde el atajo solo
+// porque otra NORMA irrelevante empató por milésimas en el 1.º.
+const DIRECT_RESPONSE_TOP_K = 3;
+
+// Holgura máxima respecto a la nº 1: sim_top1 - sim_directo. Si el mejor
+// 'directo' del top-K queda mucho por debajo del líder, no se fuerza el
+// atajo (el líder puede ser la respuesta correcta vía IA). ~0.02 cubre
+// empates tipo Emprendedor vs ruido; no deja pasar un directo flojo (0.56)
+// detrás de un top claro (0.70).
+const DIRECT_RESPONSE_MAX_GAP_FROM_TOP = 0.02;
 
 // Punto de baja confianza: si Claude no encuentra un caso claro, responde
 // exactamente este texto en vez de inventar una respuesta.
@@ -468,37 +470,33 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
   }
 
-  // Filas response_mode='directo' (p. ej. Transparencia): nunca pasan por
-  // Claude. La instrucción de la fila mejor puntuada (ya viene ordenada por
-  // similitud desde match_agent_instructions) ES el texto literal a enviar,
-  // no una instrucción para que Claude redacte. Si la similitud no llega al
-  // umbral, no se deriva a humano aquí: se sigue el flujo normal más abajo
-  // con "instructions" completo, tal como si fuera una fila IA (Claude
-  // decide con todo el contexto en vez de mandar un enlace equivocado a
-  // ciegas). Solo se deriva a humano sin pasar por Claude si, tras el
-  // filtro de 0.4 general, no queda ninguna instrucción ni evento.
+  // Atajo 'directo': mejor ficha directo en el top-K si supera el umbral y
+  // no queda lejos de la nº 1 (evita Claude en FAQs claras aunque otra fila
+  // irrelevante gane por milésimas; no fuerza un directo flojo si el top es
+  // claramente otra cosa).
   const topInstruction = instructions[0];
-  const secondInstruction = instructions[1];
-  const hasEnoughMargin = !secondInstruction
-    || (topInstruction.similarity - secondInstruction.similarity) >= DIRECT_RESPONSE_MARGIN;
-  if (
-    topInstruction
-    && topInstruction.response_mode === 'directo'
-    && topInstruction.similarity >= DIRECT_RESPONSE_THRESHOLD
-    && hasEnoughMargin
-  ) {
+  const topSim = topInstruction ? topInstruction.similarity : 0;
+  const bestDirecto = instructions
+    .slice(0, DIRECT_RESPONSE_TOP_K)
+    .filter((instr) => instr.response_mode === 'directo'
+      && instr.similarity >= DIRECT_RESPONSE_THRESHOLD)
+    .sort((a, b) => b.similarity - a.similarity)[0];
+  const closeEnoughToTop = bestDirecto
+    && (topSim - bestDirecto.similarity) <= DIRECT_RESPONSE_MAX_GAP_FROM_TOP;
+
+  if (bestDirecto && closeEnoughToTop) {
     logConsulta({
       fecha: new Date().toISOString(),
       modo: 'directo',
       consulta: citizenMessage,
-      respuesta: topInstruction.instruction,
-      fuente: summarizeInstruction(topInstruction),
+      respuesta: bestDirecto.instruction,
+      fuente: summarizeInstruction(bestDirecto),
       candidatas: summarizeCandidates(instructions),
       tokens: emptyUsage(),
       coste_usd: 0,
       modelo: null,
     });
-    return { needsHuman: false, answer: topInstruction.instruction };
+    return { needsHuman: false, answer: bestDirecto.instruction };
   }
 
   // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con
