@@ -172,15 +172,25 @@ function formatUrlReadsLine(urlReads) {
   return urlReads.map((r) => `${r.kind || 'link'} | ${r.url}`).join('  ;  ');
 }
 
-// Un solo console.log por consulta (bloque multilínea) para que en Railway
-// no se mezclen campos de preguntas distintas al pretty-print de objetos.
+// Un id corto por consulta. Railway parte los \n en eventos distintos; si hay
+// varias consultas en paralelo las líneas se entremezclan en la UI. Prefijar
+// cada línea con el mismo id permite agrupar/filtrar aunque lleguen mezcladas.
+function newConsultaLogId() {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+// Orden de campos (estable): barra → cabecera modo/fecha → Consulta →
+// Respuesta → Fuente → Lectura → (Fuente raw) → (Motivo) → Candidatas →
+// Tokens → Coste → barra. Cada línea lleva el mismo [id].
 function logConsulta(payload) {
   const bar = '='.repeat(72);
   const thin = '-'.repeat(72);
   const tokens = payload.tokens || emptyUsage();
+  const logId = newConsultaLogId();
+  const tag = `[${logId}]`;
   const lines = [
     bar,
-    `[consulta]  modo=${payload.modo}  |  ${payload.fecha}`,
+    `[consulta]  modo=${payload.modo}  |  ${payload.fecha}  |  id=${logId}`,
     thin,
     `Consulta:   ${oneLine(payload.consulta)}`,
     `Respuesta:  ${oneLine(payload.respuesta)}`,
@@ -211,7 +221,8 @@ function logConsulta(payload) {
   );
   lines.push(bar);
 
-  console.log(lines.join('\n'));
+  // Una sola escritura atómica; cada línea lleva el id por si el viewer parte el bloque.
+  process.stdout.write(`${lines.map((line) => `${tag} ${line}`).join('\n')}\n`);
 }
 
 function formatDate(isoTimestamp) {
