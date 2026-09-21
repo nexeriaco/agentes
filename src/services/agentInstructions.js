@@ -38,32 +38,41 @@ async function matchInstructions(agentId, queryText) {
   return data.filter((row) => row.similarity >= SIMILARITY_THRESHOLD);
 }
 
+// Seguimientos cortos/ambiguos donde la búsqueda solo con el mensaje del
+// ciudadano falla (p. ej. "¿y el teléfono?" tras hablar del ayuntamiento).
+// Preguntas auto-contenidas NO deben mezclarse con el mensaje previo del
+// bot: las respuestas `directo` son textos largos casi idénticos a la ficha,
+// y embeberlos en la query hace que la ficha anterior gane otra vez aunque
+// el ciudadano haya cambiado de tema (caso real: "fotos multa" → luego
+// "recibos pendientes" seguía devolviendo fotos multa con sim aún más alta).
+const FOLLOWUP_MAX_CHARS = 25;
+const FOLLOWUP_PREFIX =
+  /^(¿?\s*y\b|sí\b|si\b|ok\b|vale\b|ese\b|esa\b|eso\b|el\s+segundo|la\s+primera|más\s+info|y\s+eso)/i;
+
+function isLikelyShortFollowUp(message) {
+  const text = String(message || '').trim();
+  if (!text) return false;
+  if (text.length <= FOLLOWUP_MAX_CHARS) return true;
+  return FOLLOWUP_PREFIX.test(text);
+}
+
 // Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
 // reciente de la conversación, devuelve las instrucciones más relevantes.
 //
-// Además de la búsqueda simple (solo el mensaje del ciudadano), si hay un
-// mensaje previo del bot en el historial se hace SIEMPRE también una
-// búsqueda con contexto (ese último mensaje del bot + el mensaje del
-// ciudadano), y se combinan los resultados de ambas. No basta con reintentar
-// con contexto solo cuando la búsqueda simple no encuentra nada: un mensaje
-// de seguimiento corto y genérico ("¿y el teléfono?", "sí", "el segundo")
-// puede SÍ encontrar candidatas por sí solo — p. ej. muchas filas de
-// "teléfono, contacto" de departamentos que no tienen nada que ver — sin que
-// ninguna sea la correcta, y sin encontrar nunca la fila que sí encaja con
-// el contexto real de la conversación (caso real detectado en producción:
-// "¿y el teléfono?" tras preguntar por la dirección del ayuntamiento devolvió
-// diez filas de teléfono de otros departamentos y ninguna del ayuntamiento,
-// y Claude, con esas filas irrelevantes delante y el hilo de la conversación,
-// acabó inventándose un teléfono). Al combinar ambas búsquedas, la fila
-// relevante para el contexto tiene ocasión de aparecer junto a las de la
-// búsqueda simple, en vez de competir a ciegas por las MATCH_COUNT plazas de
-// una sola búsqueda.
+// Por defecto solo se busca con el mensaje del ciudadano. Si hay un mensaje
+// previo del bot Y el mensaje actual parece un seguimiento corto/ambiguo
+// ("¿y el teléfono?", "sí", "el segundo"), se hace además una búsqueda con
+// contexto (último mensaje del bot + mensaje del ciudadano) y se combinan
+// ambas. Eso cubre el caso real de producción en el que "¿y el teléfono?"
+// tras preguntar por la dirección del ayuntamiento devolvía teléfonos de
+// otros departamentos y Claude acababa inventando uno.
 //
-// Si no hay ningún mensaje del bot en el historial (primer mensaje de la
-// conversación), no hay contexto que combinar: se usa solo la búsqueda
-// simple, sin cambios respecto al comportamiento anterior.
+// No se combina contexto en preguntas nuevas auto-contenidas: el texto
+// previo del bot (sobre todo en mode=directo) envenenaría el embedding.
 async function getRelevantInstructions(agentId, citizenMessage, history = []) {
   const directMatches = await matchInstructions(agentId, citizenMessage);
+
+  if (!isLikelyShortFollowUp(citizenMessage)) return directMatches;
 
   let lastBotMessage = null;
   for (let i = history.length - 1; i >= 0; i -= 1) {
@@ -89,4 +98,8 @@ async function getRelevantInstructions(agentId, citizenMessage, history = []) {
     .slice(0, MATCH_COUNT);
 }
 
-module.exports = { getRelevantInstructions, SIMILARITY_THRESHOLD };
+module.exports = {
+  getRelevantInstructions,
+  SIMILARITY_THRESHOLD,
+  isLikelyShortFollowUp,
+};
