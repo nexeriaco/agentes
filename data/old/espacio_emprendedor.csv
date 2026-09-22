@@ -1,0 +1,3 @@
+agent_id,case_group,case_subgroup,instruction,associated_url,allow_url_reading,active,horas_cache_pagina,response_mode
+c1330a20-c057-4764-8121-6268ca02f280,Comercio,"Equipamiento, información del espacio del emprendedor",Para conocer toda la información sobre el espacio del emprendedor puedes consultar este enlace: https://alguazas.es/espacio-del-emprendedor/,https://alguazas.es/espacio-del-emprendedor/,False,True,,directo
+c1330a20-c057-4764-8121-6268ca02f280,Comercio,Ayudas y subvenciones a emprendedores,"Para conocer todas las ayudas y subvenciones a emprendedores, puedes contactar con el agente de desarrollo local al teléfono 654 009 902 o por correo electrónico a adl@alguazas.es.",https://alguazas.es/espacio-del-emprendedor/,False,True,,directo
