@@ -41,10 +41,40 @@ const DIRECT_RESPONSE_MAX_GAP_FROM_TOP = 0.02;
 // en los dos puntos marcados abajo en vez de solo devolver needsHuman: true.
 const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
 
+// Cierre fijo ante agradecimientos/despedidas (sin buscar fichas ni Claude).
+// Si no se cortocircuita, un "gracias" sin match directo reutilizaría el
+// tema anterior vía el enriquecimiento por contexto en agentInstructions.
+const POLITE_CLOSING_ANSWER =
+  'Gracias a ti. Cualquier cosa que necesites, no dudes en preguntar.';
+
 // Teléfono general del Ayuntamiento en data/original (directorio / página
 // principal). Se usa cuando un documento abierto no trae el dato pedido.
 // Si el agente tiene escalation_contact, ese valor tiene prioridad.
 const DEFAULT_AYUNTAMIENTO_PHONE = '968 620 022';
+
+// True si el mensaje es solo un gracias o una despedida (no una pregunta).
+function isPoliteClosingMessage(message) {
+  const text = String(message || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .replace(/[.!?¡¿]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text || text.length > 48) return false;
+
+  if (/^(muchas\s+)?gracias(\s+(mil|de antemano|por todo|por la (ayuda|info|informacion)))?$/.test(text)) {
+    return true;
+  }
+  if (/^(ok|vale|perfecto|muy bien|genial)[, ]*(muchas\s+)?gracias$/.test(text)) {
+    return true;
+  }
+  if (/^(adios|hasta luego|hasta pronto|hasta manana|chao|bye|nos vemos|buen dia|buenas noches|que tengas buen dia)$/.test(text)) {
+    return true;
+  }
+  return false;
+}
 
 // Precio Claude Haiku 4.5 (USD / millón de tokens). Caché = ephemeral 5 min.
 const HAIKU_USD_PER_MTOK = {
@@ -455,6 +485,21 @@ ${buildInstructionsBlock(instructions)}
 // no hay instrucciones ni eventos aplicables o el agente no existe, en vez
 // de responder a ciegas.
 async function generateAnswer(citizenMessage, agentId, chatId) {
+  if (isPoliteClosingMessage(citizenMessage)) {
+    logConsulta({
+      fecha: new Date().toISOString(),
+      modo: 'cierre',
+      consulta: citizenMessage,
+      respuesta: POLITE_CLOSING_ANSWER,
+      fuente: null,
+      candidatas: [],
+      tokens: emptyUsage(),
+      coste_usd: 0,
+      modelo: null,
+    });
+    return { needsHuman: false, answer: POLITE_CLOSING_ANSWER };
+  }
+
   const today = new Date().toISOString().slice(0, 10);
 
   const [agent, events, history] = await Promise.all([

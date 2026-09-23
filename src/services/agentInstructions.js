@@ -38,48 +38,26 @@ async function matchInstructions(agentId, queryText) {
   return data.filter((row) => row.similarity >= SIMILARITY_THRESHOLD);
 }
 
-// Seguimientos cortos/ambiguos donde la búsqueda solo con el mensaje del
-// ciudadano falla (p. ej. "¿y el teléfono?" tras hablar del ayuntamiento).
-// Preguntas auto-contenidas NO deben mezclarse con el mensaje previo del
-// bot: las respuestas `directo` son textos largos casi idénticos a la ficha,
-// y embeberlos en la query hace que la ficha anterior gane otra vez aunque
-// el ciudadano haya cambiado de tema (caso real: "fotos multa" → luego
-// "recibos pendientes" seguía devolviendo fotos multa con sim aún más alta).
-//
-// IMPORTANTE: no usar un techo alto de caracteres como "es follow-up".
-// En staging (2026-09-23) con FOLLOWUP_MAX_CHARS=25 se trataron como
-// seguimiento preguntas reales ("¿Cuándo son los plenos?"=23,
-// "Quiero empadronarme"=19, "Cambiar datos del padrón"=24) y el embedding
-// de la respuesta `directo` anterior ganó con sim ~0.70–0.83.
-const FOLLOWUP_ULTRA_SHORT_CHARS = 12;
-const FOLLOWUP_PREFIX =
-  /^(¿?\s*y\b|sí\b|si\b|ok\b|vale\b|ese\b|esa\b|eso\b|el\s+segundo|la\s+primera|más\s+info|y\s+eso)/i;
-
-function isLikelyShortFollowUp(message) {
-  const text = String(message || '').trim();
-  if (!text) return false;
-  if (FOLLOWUP_PREFIX.test(text)) return true;
-  // Solo réplicas mínimas ("sí", "el 2", "San Roque"), no preguntas cortas.
-  return text.length <= FOLLOWUP_ULTRA_SHORT_CHARS;
-}
-
 // Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
 // reciente de la conversación, devuelve las instrucciones más relevantes.
 //
-// Por defecto solo se busca con el mensaje del ciudadano. Si hay un mensaje
-// previo del bot Y el mensaje actual parece un seguimiento corto/ambiguo
-// ("¿y el teléfono?", "sí", "el segundo"), se hace además una búsqueda con
-// contexto (último mensaje del bot + mensaje del ciudadano) y se combinan
-// ambas. Eso cubre el caso real de producción en el que "¿y el teléfono?"
-// tras preguntar por la dirección del ayuntamiento devolvía teléfonos de
-// otros departamentos y Claude acababa inventando uno.
+// Siempre se busca primero solo con el mensaje del ciudadano. Si hay matches
+// por encima de SIMILARITY_THRESHOLD, se usan tal cual: no se mezcla el
+// mensaje previo del bot. Las respuestas `directo` son textos largos casi
+// idénticos a la ficha; embeberlos en la query hace que la ficha anterior
+// gane otra vez aunque el ciudadano haya cambiado de tema (staging
+// 2026-09-23: "plenos" → "farola rota" devolvía plenos; antes también
+// "fotos multa" → "recibos pendientes", y umbrales por longitud/prefijo
+// trataban como follow-up preguntas reales cortas).
 //
-// No se combina contexto en preguntas nuevas auto-contenidas: el texto
-// previo del bot (sobre todo en mode=directo) envenenaría el embedding.
+// Solo si el match directo está vacío Y hay un mensaje previo del assistant
+// se hace una segunda búsqueda con contexto (último bot + mensaje actual).
+// Eso cubre seguimientos ambiguos donde la búsqueda sola falla (p. ej.
+// "¿y el teléfono?" tras la dirección del ayuntamiento).
 async function getRelevantInstructions(agentId, citizenMessage, history = []) {
   const directMatches = await matchInstructions(agentId, citizenMessage);
 
-  if (!isLikelyShortFollowUp(citizenMessage)) return directMatches;
+  if (directMatches.length > 0) return directMatches;
 
   let lastBotMessage = null;
   for (let i = history.length - 1; i >= 0; i -= 1) {
@@ -90,23 +68,10 @@ async function getRelevantInstructions(agentId, citizenMessage, history = []) {
   }
   if (!lastBotMessage) return directMatches;
 
-  const contextMatches = await matchInstructions(agentId, `${lastBotMessage.content}\n${citizenMessage}`);
-
-  const bestById = new Map();
-  for (const row of [...directMatches, ...contextMatches]) {
-    const existing = bestById.get(row.id);
-    if (!existing || row.similarity > existing.similarity) {
-      bestById.set(row.id, row);
-    }
-  }
-
-  return [...bestById.values()]
-    .sort((a, b) => b.similarity - a.similarity)
-    .slice(0, MATCH_COUNT);
+  return matchInstructions(agentId, `${lastBotMessage.content}\n${citizenMessage}`);
 }
 
 module.exports = {
   getRelevantInstructions,
   SIMILARITY_THRESHOLD,
-  isLikelyShortFollowUp,
 };
