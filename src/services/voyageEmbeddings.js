@@ -84,4 +84,16 @@ async function embedQuery(text) {
   return embedding;
 }
 
-module.exports = { buildInstructionText, embedDocuments, embedQuery, VOYAGE_MODEL };
+// Varias queries en una sola llamada (mismo orden que `texts`).
+async function embedQueries(texts) {
+  if (!texts.length) return [];
+  return embed(texts, 'query');
+}
+
+module.exports = {
+  buildInstructionText,
+  embedDocuments,
+  embedQuery,
+  embedQueries,
+  VOYAGE_MODEL,
+};
