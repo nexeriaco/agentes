@@ -103,7 +103,10 @@ async function buscarUrlConCache(agentId, url, query = '', policy = null) {
 
   const result = await buscarUrl(url, policy);
   // result.content ya viene empaquetado (PAGE_CACHE_V2) o es PDF escaneado/error.
-  saveToCache(url, result.content).catch((err) => console.error('Error guardando caché de página:', err));
+  // No cachear errores: un 5xx/timeout puntual no debe servir horas de "fallo".
+  if (result.kind !== 'error') {
+    saveToCache(url, result.content).catch((err) => console.error('Error guardando caché de página:', err));
+  }
 
   if (result.fullText != null) {
     return toClaudeResult(url, { kind: result.kind, fullText: result.fullText }, query);

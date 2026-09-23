@@ -1,3 +1,5 @@
+// Canal WhatsApp fuera de servicio a propósito: no se monta en index.js
+// hasta reactivar con WHATSAPP_VERIFY_TOKEN no vacío + firma X-Hub-Signature-256.
 const express = require('express');
 
 const router = express.Router();

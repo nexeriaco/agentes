@@ -2,8 +2,10 @@ require('dotenv').config();
 
 const express = require('express');
 const helmet = require('helmet');
-const whatsappRouter = require('./routes/whatsapp');
+// WhatsApp desactivado hasta reactivar con verify + firma Meta.
+// const whatsappRouter = require('./routes/whatsapp');
 const { startPolling } = require('./telegram/poller');
+const { startEventsSyncScheduler } = require('./services/eventsSyncScheduler');
 
 const app = express();
 
@@ -14,7 +16,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.use('/whatsapp', whatsappRouter);
+// app.use('/whatsapp', whatsappRouter);
 
 const port = process.env.PORT || 3000;
 
@@ -25,3 +27,5 @@ app.listen(port, () => {
 startPolling().catch((err) => {
   console.error('El polling de Telegram se detuvo inesperadamente:', err);
 });
+
+startEventsSyncScheduler();

@@ -17,6 +17,10 @@ async function startPolling() {
   let offset = 0;
   let inFlight = 0;
   const waiters = [];
+  // Cola por chat: el mismo chatId se procesa en serie; chats distintos
+  // siguen en paralelo (hasta MAX_CONCURRENT).
+  /** @type {Map<string, Promise<void>>} */
+  const chatQueues = new Map();
 
   function acquireSlot() {
     if (inFlight < MAX_CONCURRENT) {
@@ -37,6 +41,29 @@ async function startPolling() {
     if (next) next();
   }
 
+  function enqueueForChat(chatId, work) {
+    const key = String(chatId);
+    const previous = chatQueues.get(key) || Promise.resolve();
+    const next = previous
+      .then(async () => {
+        await acquireSlot();
+        try {
+          await work();
+        } finally {
+          releaseSlot();
+        }
+      })
+      .catch((err) => {
+        console.error('Error procesando update de Telegram:', err);
+      })
+      .finally(() => {
+        if (chatQueues.get(key) === next) {
+          chatQueues.delete(key);
+        }
+      });
+    chatQueues.set(key, next);
+  }
+
   while (true) {
     try {
       const updates = await telegram.getUpdates(offset);
@@ -50,15 +77,7 @@ async function startPolling() {
         const chatId = message.chat.id;
         const text = message.text;
 
-        // No await en serie: hasta MAX_CONCURRENT handlers a la vez.
-        acquireSlot()
-          .then(() => handleIncomingMessage(chatId, text))
-          .catch((err) => {
-            console.error('Error procesando update de Telegram:', err);
-          })
-          .finally(() => {
-            releaseSlot();
-          });
+        enqueueForChat(chatId, () => handleIncomingMessage(chatId, text));
       }
     } catch (err) {
       console.error('Error en el polling de Telegram:', err);
@@ -67,4 +86,4 @@ async function startPolling() {
   }
 }
 
-module.exports = { startPolling, MAX_CONCURRENT };
+module.exports = { startPolling };

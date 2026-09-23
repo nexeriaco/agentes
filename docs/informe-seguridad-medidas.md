@@ -9,16 +9,18 @@ Rama: `railway-experimentos`
 |--------|---------|--------|
 | URLs B′ | Solo `associated_url` / `url` con `allow_url_reading` del turno | `src/services/urlGuard.js`, `answer.js` |
 | URLs B″ | PDF/enlace del **mismo hostname** que una URL B′ | `urlGuard.js` |
-| URLs C (SSRF) | DNS + bloqueo IPs privadas/metadata; redirects manuales revalidados | `urlGuard.js`, `urlTool.js` |
+| URLs C (SSRF) | DNS + bloqueo IPs privadas/metadata; redirects manuales revalidados; **lookup de conexión Undici** (2ª comprobación) | `urlGuard.js`, `urlTool.js` |
 | Límite longitud | Máx. **300** caracteres (aviso, sin Claude) | `messageHandler.js` |
 | Separación user/system | Mensaje ciudadano solo en rol `user` (sin cambio de diseño) | `answer.js` |
 | Contacto escalación | Fuera del system prompt; solo en `buildHandoffMessage` | `answer.js`, `messageHandler.js` |
 | Rate limit chat | 20 mensajes / 5 min por chat | `chatRateLimit.js` |
 | Excepciones rate | `/start` no cuenta; duplicado idéntico &lt; 2 s → silencio | `messageHandler.js`, `chatRateLimit.js` |
-| Paralelismo | Hasta **10** mensajes Telegram a la vez | `poller.js` |
+| Paralelismo | Hasta **10** mensajes Telegram a la vez; **cola por chat** (mismo chat en serie) | `poller.js` |
 | Timeout Claude | **60 s** por llamada Anthropic | `anthropic/client.js` |
 | Express body | `express.json({ limit: '100kb' })` | `index.js` |
 | Helmet | Cabeceras HTTP de seguridad | `index.js` (+ dep. `helmet`) |
+
+**WhatsApp:** canal desconectado en código (`/whatsapp` no se monta) hasta reactivar con verify + firma Meta.
 
 ## Hecho fuera de código (operación)
 

@@ -1,11 +1,23 @@
 const anthropic = require('../anthropic/client');
-const { getRelevantInstructions } = require('./agentInstructions');
+const { getRelevantInstructions, matchInstructions } = require('./agentInstructions');
 const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
 const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
 const { buscarUrlConCache } = require('./urlCache');
 const { buildReadableUrlPolicy, isUrlAllowedByPolicy } = require('./urlGuard');
 const { getRecentHistory } = require('./conversationHistory');
+const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('./politeClosing');
+const {
+  emptyUsage,
+  summarizeInstruction,
+  summarizeCandidates,
+  logConsulta,
+} = require('./consultaLog');
+const {
+  HUMAN_HANDOFF_SENTINEL,
+  buildFixedSystemPrompt,
+  buildInstructionsPrompt,
+} = require('./promptBuilder');
 
 const MODEL = 'claude-haiku-4-5';
 
@@ -34,53 +46,11 @@ const DIRECT_RESPONSE_TOP_K = 3;
 // detrás de un top claro (0.70).
 const DIRECT_RESPONSE_MAX_GAP_FROM_TOP = 0.02;
 
-// Punto de baja confianza: si Claude no encuentra un caso claro, responde
-// exactamente este texto en vez de inventar una respuesta.
-// TODO: cuando exista un canal de derivación a humano (ej. notificar a un
-// operador o crear un ticket usando agent.escalation_contact), conectarlo
-// en los dos puntos marcados abajo en vez de solo devolver needsHuman: true.
-const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
-
-// Cierre fijo ante agradecimientos/despedidas (sin buscar fichas ni Claude).
-// Si no se cortocircuita, un "gracias" sin match directo reutilizaría el
-// tema anterior vía el enriquecimiento por contexto en agentInstructions.
-const POLITE_CLOSING_ANSWER =
-  'Gracias a ti. Cualquier cosa que necesites, no dudes en preguntar.';
-
 // Sin fichas/eventos por encima del umbral: pedir reformular (0 tokens).
 // No es handoff a teléfono — suele ser consulta demasiado corta o ambigua
 // (p. ej. "farola fundida" bajo SIMILARITY_THRESHOLD).
 const REFORMULATE_ANSWER =
   'No he encontrado información clara con esa consulta. ¿Puedes reformularla con un poco más de detalle? Por ejemplo: qué necesitas, el trámite o el lugar.';
-
-// Teléfono general del Ayuntamiento en data/original (directorio / página
-// principal). Se usa cuando un documento abierto no trae el dato pedido.
-// Si el agente tiene escalation_contact, ese valor tiene prioridad.
-const DEFAULT_AYUNTAMIENTO_PHONE = '968 620 022';
-
-// True si el mensaje es solo un gracias o una despedida (no una pregunta).
-function isPoliteClosingMessage(message) {
-  const text = String(message || '')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{M}/gu, '')
-    .replace(/[.!?¡¿]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text || text.length > 48) return false;
-
-  if (/^(muchas\s+)?gracias(\s+(mil|de antemano|por todo|por la (ayuda|info|informacion)))?$/.test(text)) {
-    return true;
-  }
-  if (/^(ok|vale|perfecto|muy bien|genial)[, ]*(muchas\s+)?gracias$/.test(text)) {
-    return true;
-  }
-  if (/^(adios|hasta luego|hasta pronto|hasta manana|chao|bye|nos vemos|buen dia|buenas noches|que tengas buen dia)$/.test(text)) {
-    return true;
-  }
-  return false;
-}
 
 // Precio Claude Haiku 4.5 (USD / millón de tokens). Caché = ephemeral 5 min.
 const HAIKU_USD_PER_MTOK = {
@@ -93,15 +63,6 @@ const HAIKU_USD_PER_MTOK = {
 // Línea final que Claude añade para trazar la fila usada; se elimina antes
 // de enviar al ciudadano. Formatos: FUENTE:uuid | FUENTE:evento:id | FUENTE:ninguna
 const FUENTE_LINE_RE = /\n*FUENTE:(.+)\s*$/i;
-
-function emptyUsage() {
-  return {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-  };
-}
 
 function addUsage(totals, usage) {
   if (!usage) return totals;
@@ -120,31 +81,6 @@ function calculateHaikuCostUsd(usage) {
       + (usage.output_tokens || 0) * HAIKU_USD_PER_MTOK.output)
     / 1_000_000;
   return Number(cost.toFixed(6));
-}
-
-function summarizeInstruction(instr) {
-  if (!instr) return null;
-  return {
-    tabla: 'agent_instructions',
-    id: instr.id,
-    case_group: instr.case_group,
-    case_subgroup: instr.case_subgroup,
-    response_mode: instr.response_mode || null,
-    similarity: instr.similarity != null ? Number(instr.similarity.toFixed(4)) : null,
-  };
-}
-
-function summarizeEvent(event) {
-  if (!event) return null;
-  return {
-    tabla: 'agent_events',
-    id: event.id,
-    title: event.title,
-  };
-}
-
-function summarizeCandidates(instructions) {
-  return instructions.map(summarizeInstruction);
 }
 
 function extractFuente(rawText, instructions, events) {
@@ -166,7 +102,9 @@ function extractFuente(rawText, instructions, events) {
     const event = events.find((ev) => String(ev.id) === eventId);
     return {
       answer,
-      fuente: event ? summarizeEvent(event) : { tabla: 'agent_events', id: eventId, title: null },
+      fuente: event
+        ? { tabla: 'agent_events', id: event.id, title: event.title }
+        : { tabla: 'agent_events', id: eventId, title: null },
       fuente_raw: raw,
     };
   }
@@ -177,309 +115,6 @@ function extractFuente(rawText, instructions, events) {
     fuente: instr ? summarizeInstruction(instr) : { tabla: 'agent_instructions', id: raw },
     fuente_raw: raw,
   };
-}
-
-function formatFuenteLine(fuente) {
-  if (!fuente) return 'ninguna';
-  if (fuente.tabla === 'agent_events') {
-    return `agent_events | ${fuente.title || '(sin título)'} | id=${fuente.id}`;
-  }
-  const sim = fuente.similarity != null ? ` | sim=${fuente.similarity}` : '';
-  const mode = fuente.response_mode ? ` | mode=${fuente.response_mode}` : '';
-  return `agent_instructions | ${fuente.case_group || '?'} › ${fuente.case_subgroup || '?'} | id=${fuente.id}${sim}${mode}`;
-}
-
-function formatCandidatasLines(candidatas) {
-  if (!candidatas || candidatas.length === 0) return ['  (ninguna)'];
-  return candidatas.map((c, i) => {
-    const sim = c.similarity != null ? c.similarity.toFixed(4) : '—.———';
-    return `  ${i + 1}. [${sim}] ${c.case_group || '?'} › ${c.case_subgroup || '?'} | id=${c.id}`;
-  });
-}
-
-function oneLine(text) {
-  if (text == null) return '(vacío)';
-  return String(text).replace(/\s+/g, ' ').trim();
-}
-
-// Lecturas reales vía buscar_url: pdf | link | error; vacío → nada.
-function formatUrlReadsLine(urlReads) {
-  if (!urlReads || urlReads.length === 0) return 'nada';
-  return urlReads.map((r) => `${r.kind || 'link'} | ${r.url}`).join('  ;  ');
-}
-
-// Un id corto por consulta. Railway parte los \n en eventos distintos; si hay
-// varias consultas en paralelo las líneas se entremezclan en la UI. Prefijar
-// cada línea con el mismo id permite agrupar/filtrar aunque lleguen mezcladas.
-function newConsultaLogId() {
-  return Math.random().toString(36).slice(2, 8);
-}
-
-// Orden de campos (estable): barra → cabecera modo/fecha → Consulta →
-// Respuesta → Fuente → Lectura → (Fuente raw) → (Motivo) → Candidatas →
-// Tokens → Coste → barra. Cada línea lleva el mismo [id].
-function logConsulta(payload) {
-  const bar = '='.repeat(72);
-  const thin = '-'.repeat(72);
-  const tokens = payload.tokens || emptyUsage();
-  const logId = newConsultaLogId();
-  const tag = `[${logId}]`;
-  const lines = [
-    bar,
-    `[consulta]  modo=${payload.modo}  |  ${payload.fecha}  |  id=${logId}`,
-    thin,
-    `Consulta:   ${oneLine(payload.consulta)}`,
-    `Respuesta:  ${oneLine(payload.respuesta)}`,
-    thin,
-    `Fuente:     ${formatFuenteLine(payload.fuente)}`,
-    `Lectura:    ${formatUrlReadsLine(payload.url_reads)}`,
-  ];
-
-  if (payload.fuente_raw != null) {
-    lines.push(`Fuente raw: ${payload.fuente_raw}`);
-  }
-  if (payload.motivo) {
-    lines.push(`Motivo:     ${payload.motivo}`);
-  }
-
-  lines.push('Candidatas:');
-  lines.push(...formatCandidatasLines(payload.candidatas));
-  lines.push(thin);
-  lines.push(
-    `Tokens:     in=${tokens.input_tokens || 0}  out=${tokens.output_tokens || 0}`
-      + `  cache_w=${tokens.cache_creation_input_tokens || 0}`
-      + `  cache_r=${tokens.cache_read_input_tokens || 0}`
-  );
-  lines.push(
-    `Coste:      $${payload.coste_usd ?? 0}`
-      + `  |  modelo=${payload.modelo || '—'}`
-      + (payload.tool_calls != null ? `  |  tools=${payload.tool_calls}` : '')
-  );
-  lines.push(bar);
-
-  // Una sola escritura atómica; cada línea lleva el id por si el viewer parte el bloque.
-  process.stdout.write(`${lines.map((line) => `${tag} ${line}`).join('\n')}\n`);
-}
-
-function formatDate(isoTimestamp) {
-  return isoTimestamp ? isoTimestamp.slice(0, 10) : 'sin fecha';
-}
-
-// Calculamos nosotros el estado (no se lo pedimos a Claude): comparar
-// fechas de forma fiable es aritmética simple para código, pero es una
-// fuente de errores para un modelo pequeño razonando en texto libre.
-function daysBetween(fromDate, toDate) {
-  const ms = new Date(`${toDate}T00:00:00Z`) - new Date(`${fromDate}T00:00:00Z`);
-  return Math.round(ms / (1000 * 60 * 60 * 24));
-}
-
-function computeEventStatus(event, today) {
-  const start = formatDate(event.start_date);
-  const end = formatDate(event.end_date);
-
-  if (end !== 'sin fecha' && end < today) {
-    return `YA FINALIZÓ (hace ${daysBetween(end, today)} días, el ${end})`;
-  }
-  if (start !== 'sin fecha' && start > today) {
-    return `FUTURO (empieza en ${daysBetween(today, start)} días, el ${start})`;
-  }
-  return 'EN CURSO';
-}
-
-function buildInstructionsBlock(instructions) {
-  return instructions
-    .map((instr) => {
-      const urlLine = instr.associated_url
-        ? `URL asociada: ${instr.associated_url} (${
-            instr.allow_url_reading
-              ? 'puedes leer su contenido'
-              : 'solo puedes compartirla, no leer su contenido'
-          })`
-        : 'Sin URL asociada.';
-      return `ID: ${instr.id}\nConcejalía: ${instr.case_group}\nSubtema: ${instr.case_subgroup}\nInstrucción: ${instr.instruction}\n${urlLine}`;
-    })
-    .join('\n\n');
-}
-
-const MAX_EVENT_DESCRIPTION_CHARS = 400;
-
-function truncateDescription(text) {
-  if (!text) return 'sin descripción';
-  if (text.length <= MAX_EVENT_DESCRIPTION_CHARS) return text;
-  return `${text.slice(0, MAX_EVENT_DESCRIPTION_CHARS)}…`;
-}
-
-function buildEventsBlock(events, today) {
-  if (events.length === 0) return 'No hay eventos ni avisos registrados en la ventana actual.';
-
-  return events
-    .map((ev) => {
-      const urlLine = ev.url
-        ? `URL asociada: ${ev.url} (${
-            ev.allow_url_reading
-              ? 'puedes leer su contenido'
-              : 'solo puedes compartirla, no leer su contenido'
-          })`
-        : 'Sin URL asociada.';
-      return `ID: ${ev.id}\nEvento: ${ev.title}\nDescripción: ${truncateDescription(ev.description)}\nVigencia: del ${formatDate(
-        ev.start_date
-      )} al ${formatDate(ev.end_date)}\nESTADO (ya calculado, respecto a hoy): ${computeEventStatus(
-        ev,
-        today
-      )}\nUbicación: ${ev.location || 'no especificada'}\n${urlLine}`;
-    })
-    .join('\n\n');
-}
-
-// Parte FIJA del system prompt (tono, reglas, eventos de la ventana, tools).
-// Idéntica entre mensajes de la misma conversación el mismo día → cache_control.
-// Los casos semánticos van en buildInstructionsPrompt (sin cache_control).
-function buildFixedSystemPrompt(agent, events, today) {
-  const tone = agent.tone_instructions
-    ? agent.tone_instructions
-    : '(sin instrucciones de tono adicionales)';
-
-  const ayuntamientoPhone = (agent.escalation_contact || DEFAULT_AYUNTAMIENTO_PHONE).trim();
-
-  // Prompt fijo acortado: una sola cascada de tools, reglas sin duplicar
-  // task/examples, e historial aclarado (contexto sí, hechos nuevos no).
-  return `<role>
-Eres el asistente virtual de un ayuntamiento. Hoy es ${today}.
-Chat municipal: cercano, breve, texto plano (sin markdown ni etiquetas tipo "Caso aplicable:"), sin coletillas ("no dudes en contactar", etc.). Una sola respuesta: dato pedido, aclaración, o exactamente ${HUMAN_HANDOFF_SENTINEL}. Sin razonamiento visible.
-</role>
-
-<tone>
-${tone}
-</tone>
-
-<sources>
-Fuentes de HECHOS solo de este turno:
-1. Casos de <relevant_cases> que apliquen de verdad.
-2. Eventos de <events> que nombren explícitamente el mismo lugar, servicio o tema.
-3. Resultado de buscar_url en este turno (puede ser extracto filtrado): no inventes nada que no aparezca ahí.
-
-El historial del chat sirve para entender seguimientos ("¿y el teléfono?", "el segundo"), no para inventar datos nuevos. Si un dato concreto (teléfono, email, dirección, cifra, horario, fecha, nombre) no está literal en una fuente de este turno, no lo escribas —salvo que el ciudadano pida repetir un dato que tú ya diste en este hilo y sigue en el historial.
-No uses memoria del modelo ni conocimiento general como fuente.
-</sources>
-
-<events>
-EN CURSO / FUTURO (próx. 90 días). ESTADO ya calculado: úsalo tal cual.
-
-${buildEventsBlock(events, today)}
-</events>
-
-<tools>
-buscar_url: solo URLs con "puedes leer su contenido". Si dice "solo puedes compartirla", menciona la URL y no la abras.
-Cascada (no saltes):
-1. Texto del caso/evento si ya cubre la pregunta.
-2. Si falta info y la URL es legible → buscar_url en esa página/PDF.
-3. Si en el resultado aparece un PDF/doc concreto relacionado → segunda llamada con esa URL exacta (nunca inventada).
-4. Si aún no hay base → aplica <doc_miss> o <fallback> según el caso.
-PDF con texto → usa el texto. PDF escaneado (imágenes) → léelo; no digas al ciudadano que es un escaneo.
-No abras URL/PDF solo para un contacto (teléfono, email, dirección, horario) si ya hay un caso CONTACTO con ese dato.
-</tools>
-
-<doc_miss>
-Tras abrir un documento/página de este turno:
-A) El dato pedido NO aparece en el extracto → NO uses ${HUMAN_HANDOFF_SENTINEL}. Responde en una o dos frases naturales: que no has encontrado esa información en el documento consultado, y que puede llamar al Ayuntamiento al ${ayuntamientoPhone}. Cierra con FUENTE:ninguna (o el ID del caso del documento si lo usaste).
-B) El texto remite a OTRO archivo/ordenanza/PDF (por nombre o URL) → dilo con claridad al ciudadano (nombre del documento y URL si aparece literal en la fuente). Si esa URL exacta está entre las legibles de este turno, ábrela con buscar_url. Si no puedes abrirla en este turno, indica el archivo/enlace y, si aún falta el dato, añade que puede llamar al ${ayuntamientoPhone}.
-No inventes nombres ni URLs de documentos que no salgan en las fuentes de este turno.
-</doc_miss>
-
-<intent>
-Prefijos de subtema:
-- CONTACTO · → teléfono, email, dirección, horario, redes.
-- TRÁMITE · → cómo hacer algo, cita, app, enlace, requisitos, reserva.
-- NORMA · → ordenanza, reglamento, tasa, artículo, PDF normativo.
-
-Antes de elegir caso: contacto → CONTACTO (no NORMA ni PDFs); trámite → TRÁMITE; tasa/norma legal → NORMA (lee doc solo si está permitido).
-Si hay tipos distintos y la pregunta es ambigua ("basuras", "terraza", "perro"), pregunta: ¿contacto, trámite o norma? No mezcles tipos en una respuesta.
-</intent>
-
-<rules>
-1. Un evento solo afecta a lo que nombra. No los relacionas por fechas o proximidad temática.
-2. Evento EN CURSO que modifica el mismo lugar/servicio que un caso general → prioriza el evento y dilo con naturalidad.
-3. Varias entidades distintas en fuentes → pregunta cuál (solo opciones presentes). Si son intercambiables para lo pedido, responde con cualquiera.
-4. No completes huecos ni combines datos de dos casos (teléfonos, importes, reglas). Si chocan, aclara o pregunta.
-5. Responde solo a lo preguntado: si piden el teléfono, da el teléfono (no vuelques dirección/horario del mismo caso).
-6. Si la fuente indica un año/curso distinto al de "Hoy es ${today}", avisa en una frase. No inventes el año. En eventos EN CURSO/FUTURO no hace falta aviso solo por el ESTADO.
-</rules>
-
-<output>
-- Copia literales (teléfonos, emails, direcciones, cifras, horarios, fechas) tal cual de la fuente.
-- Última línea exactamente una de:
-  FUENTE:<ID caso>
-  FUENTE:evento:<ID evento>
-  FUENTE:ninguna
-  (aclaración o ${HUMAN_HANDOFF_SENTINEL} → FUENTE:ninguna)
-</output>
-
-<fallback>
-Sin caso/evento aplicable en absoluto (no has llegado a abrir un documento útil):
-${HUMAN_HANDOFF_SENTINEL}
-FUENTE:ninguna
-</fallback>
-
-<examples>
-Formato y decisión (no hechos reales; no reutilices datos).
-
-<example>
-<user>Pregunta ambigua entre dos entidades en los casos</user>
-<assistant>Hay más de una opción. ¿Te refieres a A o a B?
-FUENTE:ninguna</assistant>
-</example>
-
-<example>
-<user>Pregunta vaga con candidatas CONTACTO y NORMA</user>
-<assistant>¿Necesitas el teléfono de contacto o la normativa/tasas de ese tema?
-FUENTE:ninguna</assistant>
-</example>
-
-<example>
-<user>Consulta sin caso ni evento aplicable</user>
-<assistant>${HUMAN_HANDOFF_SENTINEL}
-FUENTE:ninguna</assistant>
-</example>
-
-<example>
-<user>Dato literal en un caso que aplica</user>
-<assistant>(frase natural con el dato tal cual)
-FUENTE:(id del caso)</assistant>
-</example>
-
-<example>
-<user>Abriste un PDF y el dato pedido no está en el extracto</user>
-<assistant>He consultado el documento disponible, pero no aparece esa información. Puedes llamar al Ayuntamiento al ${ayuntamientoPhone}.
-FUENTE:ninguna</assistant>
-</example>
-
-<example>
-<user>El PDF remite a otra ordenanza o archivo por nombre o URL</user>
-<assistant>En ese documento se remite a (nombre del otro archivo). Puedes consultarlo aquí: (URL exacta si aparece en la fuente).
-FUENTE:(id del caso leído)</assistant>
-</example>
-</examples>
-
-<task>
-1. Intención y caso según <intent> (interno; no etiquetes en la respuesta).
-2. Eventos según <rules>; cascada <tools>.
-3. Si abriste un doc y falta el dato o remite a otro archivo → <doc_miss>. Si no hay caso/evento → <fallback>.
-4. Respuesta <output>; avisa año si aplica (regla 6). Cierra siempre con FUENTE:...
-</task>`;
-}
-
-// Parte DINÁMICA: casos semánticos de este mensaje (sin cache_control).
-function buildInstructionsPrompt(instructions) {
-  if (instructions.length === 0) {
-    return `<relevant_cases>
-Ninguno con similitud suficiente.
-</relevant_cases>`;
-  }
-  return `<relevant_cases>
-Casos más relevantes; úsalos solo si aplican de verdad. Prefijos CONTACTO · / TRÁMITE · / NORMA · → <intent>.
-
-${buildInstructionsBlock(instructions)}
-</relevant_cases>`;
 }
 
 // Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
@@ -508,12 +143,18 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const [agent, events, history] = await Promise.all([
+  const [agent, events, history, directMatches] = await Promise.all([
     getAgent(agentId),
     getRelevantEvents(agentId, today),
     getRecentHistory(agentId, chatId),
+    matchInstructions(agentId, citizenMessage),
   ]);
-  const instructions = await getRelevantInstructions(agentId, citizenMessage, history);
+  const instructions = await getRelevantInstructions(
+    agentId,
+    citizenMessage,
+    history,
+    { directMatches }
+  );
 
   if (!agent) {
     logConsulta({
@@ -697,4 +338,4 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   return { needsHuman: false, answer };
 }
 
-module.exports = { generateAnswer, buildFixedSystemPrompt, buildInstructionsPrompt, logConsulta };
+module.exports = { generateAnswer };

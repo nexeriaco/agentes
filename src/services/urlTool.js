@@ -1,6 +1,7 @@
 const { PDFParse } = require('pdf-parse');
 const { compile } = require('html-to-text');
-const { assertFetchableUrl, UrlGuardError } = require('./urlGuard');
+const { fetch: undiciFetch } = require('undici');
+const { assertFetchableUrl, getSafeFetchDispatcher, UrlGuardError } = require('./urlGuard');
 
 const MAX_BYTES = 20 * 1024 * 1024; // 20MB
 const FETCH_TIMEOUT_MS = 15000;
@@ -247,9 +248,10 @@ async function fetchWithLimit(url, policy) {
 
     let response;
     try {
-      response = await fetch(currentUrl, {
+      response = await undiciFetch(currentUrl, {
         signal: controller.signal,
         redirect: 'manual',
+        dispatcher: getSafeFetchDispatcher(),
         headers: { Accept: 'text/html,application/pdf,*/*' },
       });
     } finally {
@@ -384,11 +386,6 @@ async function buscarUrl(url, policy) {
 
 module.exports = {
   buscarUrl,
-  fetchUrlRaw,
   toClaudeResult,
   unpackFullTextCache,
-  packFullTextCache,
-  selectRelevantExtracts,
-  buildClaudeText,
-  CACHE_V2_PREFIX,
 };

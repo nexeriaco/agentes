@@ -161,12 +161,52 @@ async function assertFetchableUrl(urlString, policy) {
   await assertSafeNetworkTarget(urlString);
 }
 
+// Dispatcher Undici: el lookup de conexión vuelve a rechazar IPs privadas
+// (segunda comprobación, en el momento de conectar; la primera es assertSafeNetworkTarget).
+let safeDispatcher;
+
+function createSafeLookup() {
+  const dnsCb = require('dns');
+  return function safeLookup(hostname, options, callback) {
+    const cb = typeof options === 'function' ? options : callback;
+    const opts = typeof options === 'function' ? undefined : options;
+    dnsCb.lookup(hostname, opts || {}, (err, address, family) => {
+      if (err) return cb(err);
+      if (typeof address === 'string') {
+        if (isPrivateOrBlockedIp(address)) {
+          return cb(new UrlGuardError('Destino de red no permitido.'));
+        }
+        return cb(null, address, family);
+      }
+      // all: true → address es array de { address, family }
+      if (Array.isArray(address)) {
+        for (const entry of address) {
+          if (isPrivateOrBlockedIp(entry.address)) {
+            return cb(new UrlGuardError('Destino de red no permitido.'));
+          }
+        }
+      }
+      return cb(null, address, family);
+    });
+  };
+}
+
+function getSafeFetchDispatcher() {
+  if (!safeDispatcher) {
+    const { Agent } = require('undici');
+    safeDispatcher = new Agent({
+      connect: {
+        lookup: createSafeLookup(),
+      },
+    });
+  }
+  return safeDispatcher;
+}
+
 module.exports = {
   UrlGuardError,
   buildReadableUrlPolicy,
   isUrlAllowedByPolicy,
-  assertSafeNetworkTarget,
   assertFetchableUrl,
-  normalizeUrlKey,
-  normalizeHostname,
+  getSafeFetchDispatcher,
 };

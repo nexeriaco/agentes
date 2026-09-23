@@ -15,4 +15,4 @@ const auth = new google.auth.GoogleAuth({
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-module.exports = { sheets, serviceAccountEmail: credentials.client_email };
+module.exports = { sheets };

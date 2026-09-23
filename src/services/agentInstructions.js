@@ -94,8 +94,10 @@ async function isSameTopicAsPreviousUser(citizenMessage, previousUserMessage) {
 // 3. Al enriquecer, concatenar último USER + mensaje actual — nunca el
 //    texto `directo` del bot (envenena el embedding; staging: plenos →
 //    "farola rota" devolvía plenos con sim ~0.72).
-async function getRelevantInstructions(agentId, citizenMessage, history = []) {
-  const directMatches = await matchInstructions(agentId, citizenMessage);
+async function getRelevantInstructions(agentId, citizenMessage, history = [], options = {}) {
+  const directMatches = options.directMatches !== undefined
+    ? options.directMatches
+    : await matchInstructions(agentId, citizenMessage);
   if (directMatches.length > 0) return directMatches;
 
   const lastUserMessage = findLastByRole(history, 'user');
@@ -118,7 +120,5 @@ async function getRelevantInstructions(agentId, citizenMessage, history = []) {
 
 module.exports = {
   getRelevantInstructions,
-  SIMILARITY_THRESHOLD,
-  TOPIC_CONTINUITY_THRESHOLD,
-  isLexicalFollowUp,
+  matchInstructions,
 };

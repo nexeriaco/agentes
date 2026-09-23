@@ -1,15 +1,16 @@
 const { getTelegramRouting } = require('../services/routing');
-const { generateAnswer, logConsulta } = require('../services/answer');
+const { generateAnswer } = require('../services/answer');
+const { logConsulta, emptyUsage } = require('../services/consultaLog');
+const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('../services/politeClosing');
 const { appendTurn } = require('../services/conversationHistory');
 const { checkChatRateLimit } = require('../services/chatRateLimit');
+const { DEFAULT_AYUNTAMIENTO_PHONE } = require('../constants');
 const telegram = require('./client');
 
 // Se usa cuando no hay un escalation_contact configurado para el agente
 // (p. ej. si no se pudo identificar la ruta/agente en absoluto).
 const GENERIC_HANDOFF_MESSAGE =
   'Gracias por tu mensaje. Un miembro de nuestro equipo se pondrá en contacto contigo en breve.';
-
-const DEFAULT_AYUNTAMIENTO_PHONE = '968 620 022';
 
 const WELCOME_MESSAGE =
   '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información que necesites.';
@@ -59,12 +60,7 @@ async function handleIncomingMessage(chatId, text) {
         respuesta: WELCOME_MESSAGE,
         fuente: null,
         candidatas: [],
-        tokens: {
-          input_tokens: 0,
-          output_tokens: 0,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
-        },
+        tokens: emptyUsage(),
         coste_usd: 0,
         modelo: null,
         motivo: 'apertura_chat',
@@ -84,6 +80,30 @@ async function handleIncomingMessage(chatId, text) {
         await telegram.sendMessage(chatId, RATE_LIMIT_MESSAGE);
       }
       // duplicate: silencio (mismo texto al instante)
+      return;
+    }
+
+    // Cierre educado: tras rate limit, antes de routing / Claude (0 Voyage).
+    if (isPoliteClosingMessage(trimmed)) {
+      logConsulta({
+        fecha: new Date().toISOString(),
+        modo: 'cierre',
+        consulta: trimmed,
+        respuesta: POLITE_CLOSING_ANSWER,
+        fuente: null,
+        candidatas: [],
+        tokens: emptyUsage(),
+        coste_usd: 0,
+        modelo: null,
+      });
+      await telegram.sendMessage(chatId, POLITE_CLOSING_ANSWER);
+
+      const routing = await getTelegramRouting(telegram.getBotId());
+      if (routing) {
+        await appendTurn(routing.agentId, chatId, trimmed, POLITE_CLOSING_ANSWER).catch((err) =>
+          console.error('Error guardando historial de conversación:', err)
+        );
+      }
       return;
     }
 
@@ -115,4 +135,4 @@ async function handleIncomingMessage(chatId, text) {
   }
 }
 
-module.exports = { handleIncomingMessage, MAX_MESSAGE_CHARS };
+module.exports = { handleIncomingMessage };

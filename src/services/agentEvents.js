@@ -42,4 +42,4 @@ async function getRelevantEvents(agentId, today) {
   return data.filter((event) => isWithinPromptWindow(event, today));
 }
 
-module.exports = { getRelevantEvents, FUTURE_WINDOW_DAYS };
+module.exports = { getRelevantEvents };

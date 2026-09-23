@@ -14,4 +14,3 @@ const anthropic = new Anthropic({
 });
 
 module.exports = anthropic;
-module.exports.REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_MS;
