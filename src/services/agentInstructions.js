@@ -45,15 +45,22 @@ async function matchInstructions(agentId, queryText) {
 // y embeberlos en la query hace que la ficha anterior gane otra vez aunque
 // el ciudadano haya cambiado de tema (caso real: "fotos multa" → luego
 // "recibos pendientes" seguía devolviendo fotos multa con sim aún más alta).
-const FOLLOWUP_MAX_CHARS = 25;
+//
+// IMPORTANTE: no usar un techo alto de caracteres como "es follow-up".
+// En staging (2026-09-23) con FOLLOWUP_MAX_CHARS=25 se trataron como
+// seguimiento preguntas reales ("¿Cuándo son los plenos?"=23,
+// "Quiero empadronarme"=19, "Cambiar datos del padrón"=24) y el embedding
+// de la respuesta `directo` anterior ganó con sim ~0.70–0.83.
+const FOLLOWUP_ULTRA_SHORT_CHARS = 12;
 const FOLLOWUP_PREFIX =
   /^(¿?\s*y\b|sí\b|si\b|ok\b|vale\b|ese\b|esa\b|eso\b|el\s+segundo|la\s+primera|más\s+info|y\s+eso)/i;
 
 function isLikelyShortFollowUp(message) {
   const text = String(message || '').trim();
   if (!text) return false;
-  if (text.length <= FOLLOWUP_MAX_CHARS) return true;
-  return FOLLOWUP_PREFIX.test(text);
+  if (FOLLOWUP_PREFIX.test(text)) return true;
+  // Solo réplicas mínimas ("sí", "el 2", "San Roque"), no preguntas cortas.
+  return text.length <= FOLLOWUP_ULTRA_SHORT_CHARS;
 }
 
 // Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
