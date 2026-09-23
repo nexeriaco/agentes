@@ -47,6 +47,12 @@ const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
 const POLITE_CLOSING_ANSWER =
   'Gracias a ti. Cualquier cosa que necesites, no dudes en preguntar.';
 
+// Sin fichas/eventos por encima del umbral: pedir reformular (0 tokens).
+// No es handoff a teléfono — suele ser consulta demasiado corta o ambigua
+// (p. ej. "farola fundida" bajo SIMILARITY_THRESHOLD).
+const REFORMULATE_ANSWER =
+  'No he encontrado información clara con esa consulta. ¿Puedes reformularla con un poco más de detalle? Por ejemplo: qué necesitas, el trámite o el lugar.';
+
 // Teléfono general del Ayuntamiento en data/original (directorio / página
 // principal). Se usa cuando un documento abierto no trae el dato pedido.
 // Si el agente tiene escalation_contact, ese valor tiene prioridad.
@@ -482,8 +488,8 @@ ${buildInstructionsBlock(instructions)}
 // generales, los eventos vigentes/próximos 90 días (con su estado ya
 // calculado) y la configuración (tono, contacto de escalación) de ese
 // agente como contexto. Devuelve { needsHuman: true, answer: null } cuando
-// no hay instrucciones ni eventos aplicables o el agente no existe, en vez
-// de responder a ciegas.
+// el agente no existe. Si el agente existe pero no hay instrucciones ni
+// eventos aplicables, pide reformular (sin derivar a teléfono).
 async function generateAnswer(citizenMessage, agentId, chatId) {
   if (isPoliteClosingMessage(citizenMessage)) {
     logConsulta({
@@ -509,8 +515,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   ]);
   const instructions = await getRelevantInstructions(agentId, citizenMessage, history);
 
-  if (!agent || (instructions.length === 0 && events.length === 0)) {
-    // TODO: derivar a un humano.
+  if (!agent) {
     logConsulta({
       fecha: new Date().toISOString(),
       modo: 'handoff',
@@ -521,9 +526,25 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       tokens: emptyUsage(),
       coste_usd: 0,
       modelo: null,
-      motivo: !agent ? 'agente_inactivo_o_inexistente' : 'sin_instrucciones_ni_eventos',
+      motivo: 'agente_inactivo_o_inexistente',
     });
-    return { needsHuman: true, answer: null, escalationContact: agent ? agent.escalation_contact : null };
+    return { needsHuman: true, answer: null, escalationContact: null };
+  }
+
+  if (instructions.length === 0 && events.length === 0) {
+    logConsulta({
+      fecha: new Date().toISOString(),
+      modo: 'reformular',
+      consulta: citizenMessage,
+      respuesta: REFORMULATE_ANSWER,
+      fuente: null,
+      candidatas: [],
+      tokens: emptyUsage(),
+      coste_usd: 0,
+      modelo: null,
+      motivo: 'sin_instrucciones_ni_eventos',
+    });
+    return { needsHuman: false, answer: REFORMULATE_ANSWER };
   }
 
   // Atajo 'directo': mejor ficha directo en el top-K si supera el umbral y
