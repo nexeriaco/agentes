@@ -1,10 +1,7 @@
 const { DEFAULT_AYUNTAMIENTO_PHONE } = require('../constants');
 
-// Punto de baja confianza: si Claude no encuentra un caso claro, responde
-// exactamente este texto en vez de inventar una respuesta.
-// TODO: cuando exista un canal de derivación a humano (ej. notificar a un
-// operador o crear un ticket usando agent.escalation_contact), conectarlo
-// en los dos puntos marcados abajo en vez de solo devolver needsHuman: true.
+// Señal interna para Claude cuando no hay fuente aplicable.
+// answer.js la traduce a REFORMULATE_ANSWER (el ciudadano no ve este texto).
 const HUMAN_HANDOFF_SENTINEL = 'DERIVAR_A_HUMANO';
 
 function formatDate(isoTimestamp) {

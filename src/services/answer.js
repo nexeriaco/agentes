@@ -97,10 +97,9 @@ function extractFuente(rawText, instructions, events) {
 // enrutamiento y el chatId de la conversación (para recuperar su
 // historial reciente), y genera la respuesta usando las instrucciones
 // generales, los eventos vigentes/próximos 90 días (con su estado ya
-// calculado) y la configuración (tono, contacto de escalación) de ese
-// agente como contexto. Devuelve { needsHuman: true, answer: null } cuando
-// el agente no existe. Si el agente existe pero no hay instrucciones ni
-// eventos aplicables, pide reformular (sin derivar a teléfono).
+// calculado) y la configuración (tono) de ese agente como contexto.
+// Si no hay agente, fichas/eventos o Claude marca el sentinel interno,
+// devuelve REFORMULATE_ANSWER (nunca deriva a humano / teléfono).
 async function generateAnswer(citizenMessage, agentId, chatId) {
   if (isPoliteClosingMessage(citizenMessage)) {
     logConsulta({
@@ -114,7 +113,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       coste_usd: 0,
       modelo: null,
     });
-    return { needsHuman: false, answer: POLITE_CLOSING_ANSWER };
+    return { answer: POLITE_CLOSING_ANSWER };
   }
 
   const today = new Date().toISOString().slice(0, 10);
@@ -135,9 +134,9 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   if (!agent) {
     logConsulta({
       fecha: new Date().toISOString(),
-      modo: 'handoff',
+      modo: 'reformular',
       consulta: citizenMessage,
-      respuesta: null,
+      respuesta: REFORMULATE_ANSWER,
       fuente: null,
       candidatas: summarizeCandidates(instructions),
       tokens: emptyUsage(),
@@ -145,7 +144,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       modelo: null,
       motivo: 'agente_inactivo_o_inexistente',
     });
-    return { needsHuman: true, answer: null, escalationContact: null };
+    return { answer: REFORMULATE_ANSWER };
   }
 
   if (instructions.length === 0 && events.length === 0) {
@@ -161,7 +160,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       modelo: null,
       motivo: 'sin_instrucciones_ni_eventos',
     });
-    return { needsHuman: false, answer: REFORMULATE_ANSWER };
+    return { answer: REFORMULATE_ANSWER };
   }
 
   // Atajo 'directo': FAQs claras sin Claude. En CONTACTO exige que la
@@ -181,7 +180,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       coste_usd: 0,
       modelo: null,
     });
-    return { needsHuman: false, answer: bestDirecto.instruction };
+    return { answer: bestDirecto.instruction };
   }
 
   // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con
@@ -260,16 +259,13 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   const { answer, fuente, fuente_raw } = extractFuente(text, instructions, events);
   const costeUsd = calculateHaikuCostUsd(usageTotals);
 
-  // Handoff si la respuesta (o el texto crudo) es solo el sentinel, o si lo
-  // incluye como marcador (p. ej. explicación + DERIVAR_A_HUMANO).
-  const answerIsHandoff = answer === HUMAN_HANDOFF_SENTINEL
+  // Sentinel interno de Claude (DERIVAR_A_HUMANO) → reformular al ciudadano.
+  const answerIsReformulateSentinel = answer === HUMAN_HANDOFF_SENTINEL
     || text === HUMAN_HANDOFF_SENTINEL
     || new RegExp(`(^|\\n)\\s*${HUMAN_HANDOFF_SENTINEL}\\s*($|\\n)`, 'i').test(answer)
     || new RegExp(`(^|\\n)\\s*${HUMAN_HANDOFF_SENTINEL}\\s*($|\\n)`, 'i').test(text);
 
-  if (answerIsHandoff) {
-    // Antes: DERIVAR_A_HUMANO → mensaje "llama al Ayuntamiento".
-    // Ahora: misma respuesta fija que cuando no hay fichas (reformular).
+  if (answerIsReformulateSentinel) {
     logConsulta({
       fecha: new Date().toISOString(),
       modo: 'reformular',
@@ -285,7 +281,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       tool_calls: toolCallCount,
       motivo: 'sentinel_reformular',
     });
-    return { needsHuman: false, answer: REFORMULATE_ANSWER };
+    return { answer: REFORMULATE_ANSWER };
   }
 
   logConsulta({
@@ -303,7 +299,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     tool_calls: toolCallCount,
   });
 
-  return { needsHuman: false, answer };
+  return { answer };
 }
 
 module.exports = { generateAnswer };

@@ -101,14 +101,12 @@ async function handleIncomingMessage(chatId, text) {
       return;
     }
 
-    const { needsHuman, answer } = await generateAnswer(
+    const { answer } = await generateAnswer(
       trimmed,
       routing.agentId,
       chatId
     );
-    // needsHuman (agente inactivo / sin ruta): misma respuesta que reformular,
-    // sin mensaje de "llama al Ayuntamiento".
-    const finalText = needsHuman ? REFORMULATE_ANSWER : answer;
+    const finalText = answer || REFORMULATE_ANSWER;
 
     await telegram.sendMessage(chatId, finalText);
 
