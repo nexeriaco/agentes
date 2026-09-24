@@ -26,12 +26,10 @@ const MODEL = 'claude-haiku-4-5';
 // camino feliz, se deja margen para reintentos).
 const MAX_TOOL_CALLS = 4;
 
-// Similitud mínima para responder sin pasar por Claude en absoluto (filas
-// response_mode='directo', p. ej. Transparencia). Más exigente que
-// SIMILARITY_THRESHOLD (0.4, en agentInstructions.js) porque aquí no hay
-// ningún criterio de Claude revisando después: un falso positivo se envía
-// tal cual, con seguridad total. Punto de partida a calibrar con datos
-// reales, igual que se calibró el 0.4 general.
+// Similitud mínima para el atajo 'directo' cuando hay VARIAS candidatas.
+// Más exigente que SIMILARITY_THRESHOLD (0.4) porque Claude no revisa
+// después. Excepción: si solo hay 1 candidata y es 'directo', basta el 0.4
+// (ya filtrado en matchInstructions) — no hay ambigüedad.
 const DIRECT_RESPONSE_THRESHOLD = 0.55;
 
 // Cuántas candidatas (ya ordenadas por similitud) se miran para un atajo
@@ -188,19 +186,27 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     return { needsHuman: false, answer: REFORMULATE_ANSWER };
   }
 
-  // Atajo 'directo': mejor ficha directo en el top-K si supera el umbral y
-  // no queda lejos de la nº 1 (evita Claude en FAQs claras aunque otra fila
-  // irrelevante gane por milésimas; no fuerza un directo flojo si el top es
-  // claramente otra cosa).
+  // Atajo 'directo':
+  // a) Única candidata (ya ≥ SIMILARITY_THRESHOLD 0.4) y es 'directo' →
+  //    devolverla sin Claude: no hay ambigüedad que resolver.
+  // b) Varias candidatas: mejor 'directo' del top-K si supera
+  //    DIRECT_RESPONSE_THRESHOLD (0.55) y no queda lejos de la nº 1
+  //    (evita Claude en FAQs claras aunque otra fila irrelevante gane por
+  //    milésimas; no fuerza un directo flojo si el top es claramente otra).
   const topInstruction = instructions[0];
   const topSim = topInstruction ? topInstruction.similarity : 0;
-  const bestDirecto = instructions
+  const soleDirecto = instructions.length === 1
+    && topInstruction.response_mode === 'directo'
+    ? topInstruction
+    : null;
+  const bestDirecto = soleDirecto || instructions
     .slice(0, DIRECT_RESPONSE_TOP_K)
     .filter((instr) => instr.response_mode === 'directo'
       && instr.similarity >= DIRECT_RESPONSE_THRESHOLD)
     .sort((a, b) => b.similarity - a.similarity)[0];
-  const closeEnoughToTop = bestDirecto
-    && (topSim - bestDirecto.similarity) <= DIRECT_RESPONSE_MAX_GAP_FROM_TOP;
+  const closeEnoughToTop = soleDirecto
+    || (bestDirecto
+      && (topSim - bestDirecto.similarity) <= DIRECT_RESPONSE_MAX_GAP_FROM_TOP);
 
   if (bestDirecto && closeEnoughToTop) {
     logConsulta({
