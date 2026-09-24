@@ -18,6 +18,7 @@ const {
   buildFixedSystemPrompt,
   buildInstructionsPrompt,
 } = require('./promptBuilder');
+const { REFORMULATE_ANSWER } = require('../constants');
 
 const MODEL = 'claude-haiku-4-5';
 
@@ -44,11 +45,98 @@ const DIRECT_RESPONSE_TOP_K = 3;
 // detrás de un top claro (0.70).
 const DIRECT_RESPONSE_MAX_GAP_FROM_TOP = 0.02;
 
-// Sin fichas/eventos por encima del umbral: pedir reformular (0 tokens).
-// No es handoff a teléfono — suele ser consulta demasiado corta o ambigua
-// (p. ej. "farola fundida" bajo SIMILARITY_THRESHOLD).
-const REFORMULATE_ANSWER =
-  'No he encontrado información clara con esa consulta. ¿Puedes reformularla con un poco más de detalle? Por ejemplo: qué necesitas, el trámite o el lugar.';
+// Si las 2 mejores 'directo' empatan cerca, no forzar atajo: Claude elige
+// o pregunta (CONTACTO y resto de temáticas).
+const DIRECTO_AMBIGUITY_GAP = 0.03;
+
+// Tokens genéricos en nombres CONTACTO: no sirven para validar la entidad
+// ("Municipal" empataba Polideportivo/Biblioteca con "ayuntamiento").
+const CONTACT_STOPWORDS = new Set([
+  'municipal', 'municipales', 'servicio', 'servicios', 'concejalia',
+  'oficina', 'centro', 'local', 'alguazas', 'villa', 'reina',
+  // No son entidad: si "Teléfono…" va al inicio del subgrupo, no debe
+  // validar cualquier consulta de teléfono.
+  'telefono', 'horario', 'contacto', 'numero', 'llamar', 'centralita',
+  'atencion', 'publico', 'email', 'direccion', 'info',
+]);
+
+function normalizeContactText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '');
+}
+
+function isContactPhoneRow(instr) {
+  const sub = normalizeContactText(instr.case_subgroup);
+  return sub.includes('telefono, contacto');
+}
+
+function contactEntityName(instr) {
+  const sub = String(instr.case_subgroup || '');
+  // Preferir el tramo "Nombre - teléfono…" aunque haya frases antes
+  // ("Teléfono del ayuntamiento. … Ayuntamiento de Alguazas - teléfono").
+  const dashTel = sub.match(/([^-]+?)\s*-\s*tel/i);
+  if (dashTel) return dashTel[1].replace(/^.*\.\s*/, '').trim();
+  return sub.trim();
+}
+
+function queryMentionsContactEntity(query, entityName) {
+  const q = normalizeContactText(query);
+  const name = normalizeContactText(entityName);
+  if (name && q.includes(name)) return true;
+  const tokens = name
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 4 && !CONTACT_STOPWORDS.has(t));
+  return tokens.some((t) => q.includes(t));
+}
+
+// True si hay ≥2 'directo' por encima del umbral y la 1ª y 2ª están a
+// menos de DIRECTO_AMBIGUITY_GAP (ranking inestable → mejor IA).
+function isAmbiguousDirectoCluster(directoPool) {
+  if (directoPool.length < 2) return false;
+  const sorted = [...directoPool].sort((a, b) => b.similarity - a.similarity);
+  return (sorted[0].similarity - sorted[1].similarity) < DIRECTO_AMBIGUITY_GAP;
+}
+
+// Elige atajo 'directo'.
+// - CONTACTO: además exige que la consulta nombre la entidad.
+// - Cualquier temática: si dos 'directo' empatan → no atajo (IA).
+function pickBestDirecto(instructions, citizenMessage) {
+  if (instructions.length === 1
+    && instructions[0].response_mode === 'directo') {
+    return { instr: instructions[0], reason: 'sole' };
+  }
+
+  const pool = instructions.filter((instr) => instr.response_mode === 'directo'
+    && instr.similarity >= DIRECT_RESPONSE_THRESHOLD);
+  if (pool.length === 0) return null;
+
+  // CONTACTO: priorizar filas cuya entidad aparece en la consulta.
+  const mentioned = pool.filter((instr) => !isContactPhoneRow(instr)
+    || queryMentionsContactEntity(citizenMessage, contactEntityName(instr)));
+
+  const ranked = (mentioned.length > 0 ? mentioned : pool)
+    .slice()
+    .sort((a, b) => b.similarity - a.similarity);
+
+  // Empate entre las dos mejores del conjunto elegido → Claude.
+  if (isAmbiguousDirectoCluster(ranked)) {
+    return null;
+  }
+
+  const best = ranked[0];
+  const topSim = instructions[0].similarity;
+
+  // Si llegamos por mención de entidad CONTACTO, aceptar aunque no sea la nº1
+  // global (p. ej. Ayuntamiento 3º, Polideportivo 1º).
+  if (mentioned.length > 0 && isContactPhoneRow(best)) {
+    return { instr: best, reason: 'contact_entity' };
+  }
+
+  if ((topSim - best.similarity) > DIRECT_RESPONSE_MAX_GAP_FROM_TOP) return null;
+  return { instr: best, reason: 'top' };
+}
 
 // Precio Claude Haiku 4.5 (USD / millón de tokens). Caché = ephemeral 5 min.
 const HAIKU_USD_PER_MTOK = {
@@ -186,29 +274,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     return { needsHuman: false, answer: REFORMULATE_ANSWER };
   }
 
-  // Atajo 'directo':
-  // a) Única candidata (ya ≥ SIMILARITY_THRESHOLD 0.4) y es 'directo' →
-  //    devolverla sin Claude: no hay ambigüedad que resolver.
-  // b) Varias candidatas: mejor 'directo' del top-K si supera
-  //    DIRECT_RESPONSE_THRESHOLD (0.55) y no queda lejos de la nº 1
-  //    (evita Claude en FAQs claras aunque otra fila irrelevante gane por
-  //    milésimas; no fuerza un directo flojo si el top es claramente otra).
-  const topInstruction = instructions[0];
-  const topSim = topInstruction ? topInstruction.similarity : 0;
-  const soleDirecto = instructions.length === 1
-    && topInstruction.response_mode === 'directo'
-    ? topInstruction
-    : null;
-  const bestDirecto = soleDirecto || instructions
-    .slice(0, DIRECT_RESPONSE_TOP_K)
-    .filter((instr) => instr.response_mode === 'directo'
-      && instr.similarity >= DIRECT_RESPONSE_THRESHOLD)
-    .sort((a, b) => b.similarity - a.similarity)[0];
-  const closeEnoughToTop = soleDirecto
-    || (bestDirecto
-      && (topSim - bestDirecto.similarity) <= DIRECT_RESPONSE_MAX_GAP_FROM_TOP);
+  // Atajo 'directo': FAQs claras sin Claude. En CONTACTO exige que la
+  // consulta nombre la entidad (evita Polideportivo con "ayuntamiento").
+  const picked = pickBestDirecto(instructions, citizenMessage);
+  const bestDirecto = picked && picked.instr;
 
-  if (bestDirecto && closeEnoughToTop) {
+  if (bestDirecto) {
     logConsulta({
       fecha: new Date().toISOString(),
       modo: 'directo',
@@ -307,12 +378,13 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     || new RegExp(`(^|\\n)\\s*${HUMAN_HANDOFF_SENTINEL}\\s*($|\\n)`, 'i').test(text);
 
   if (answerIsHandoff) {
-    // TODO: derivar a un humano.
+    // Antes: DERIVAR_A_HUMANO → mensaje "llama al Ayuntamiento".
+    // Ahora: misma respuesta fija que cuando no hay fichas (reformular).
     logConsulta({
       fecha: new Date().toISOString(),
-      modo: 'handoff',
+      modo: 'reformular',
       consulta: citizenMessage,
-      respuesta: HUMAN_HANDOFF_SENTINEL,
+      respuesta: REFORMULATE_ANSWER,
       fuente,
       fuente_raw,
       url_reads: urlReads,
@@ -321,9 +393,9 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       coste_usd: costeUsd,
       modelo: MODEL,
       tool_calls: toolCallCount,
-      motivo: 'sentinel_derivar_a_humano',
+      motivo: 'sentinel_reformular',
     });
-    return { needsHuman: true, answer: null, escalationContact: agent.escalation_contact };
+    return { needsHuman: false, answer: REFORMULATE_ANSWER };
   }
 
   logConsulta({

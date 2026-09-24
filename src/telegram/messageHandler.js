@@ -4,13 +4,8 @@ const { logConsulta, emptyUsage } = require('../services/consultaLog');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('../services/politeClosing');
 const { appendTurn } = require('../services/conversationHistory');
 const { checkChatRateLimit } = require('../services/chatRateLimit');
-const { DEFAULT_AYUNTAMIENTO_PHONE } = require('../constants');
+const { REFORMULATE_ANSWER } = require('../constants');
 const telegram = require('./client');
-
-// Se usa cuando no hay un escalation_contact configurado para el agente
-// (p. ej. si no se pudo identificar la ruta/agente en absoluto).
-const GENERIC_HANDOFF_MESSAGE =
-  'Gracias por tu mensaje. Un miembro de nuestro equipo se pondrá en contacto contigo en breve.';
 
 const WELCOME_MESSAGE =
   '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información que necesites.';
@@ -27,14 +22,6 @@ const RATE_LIMIT_MESSAGE =
 // No es un comando que el ciudadano escriba: es el evento de apertura.
 // Respondemos con el mensaje inicial fijo, sin Claude (0 tokens).
 const TELEGRAM_OPEN_CHAT_RE = /^\/start(?:@\w+)?$/i;
-
-function buildHandoffMessage(escalationContact) {
-  const phone = (escalationContact || DEFAULT_AYUNTAMIENTO_PHONE).trim();
-  if (phone) {
-    return `Gracias por tu mensaje. Para resolver tu consulta, por favor llama al Ayuntamiento al ${phone}.`;
-  }
-  return GENERIC_HANDOFF_MESSAGE;
-}
 
 function isTelegramOpenChat(text) {
   return TELEGRAM_OPEN_CHAT_RE.test((text || '').trim());
@@ -114,12 +101,14 @@ async function handleIncomingMessage(chatId, text) {
       return;
     }
 
-    const { needsHuman, answer, escalationContact } = await generateAnswer(
+    const { needsHuman, answer } = await generateAnswer(
       trimmed,
       routing.agentId,
       chatId
     );
-    const finalText = needsHuman ? buildHandoffMessage(escalationContact) : answer;
+    // needsHuman (agente inactivo / sin ruta): misma respuesta que reformular,
+    // sin mensaje de "llama al Ayuntamiento".
+    const finalText = needsHuman ? REFORMULATE_ANSWER : answer;
 
     await telegram.sendMessage(chatId, finalText);
 
