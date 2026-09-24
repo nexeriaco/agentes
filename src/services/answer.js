@@ -7,6 +7,7 @@ const { buscarUrlConCache } = require('./urlCache');
 const { buildReadableUrlPolicy, isUrlAllowedByPolicy } = require('./urlGuard');
 const { getRecentHistory } = require('./conversationHistory');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('./politeClosing');
+const { pickBestDirecto } = require('./directoShortcut');
 const {
   emptyUsage,
   summarizeInstruction,
@@ -26,117 +27,6 @@ const MODEL = 'claude-haiku-4-5';
 // respuesta final (evita bucles: página general + PDF concreto son 2 en el
 // camino feliz, se deja margen para reintentos).
 const MAX_TOOL_CALLS = 4;
-
-// Similitud mínima para el atajo 'directo' cuando hay VARIAS candidatas.
-// Más exigente que SIMILARITY_THRESHOLD (0.4) porque Claude no revisa
-// después. Excepción: si solo hay 1 candidata y es 'directo', basta el 0.4
-// (ya filtrado en matchInstructions) — no hay ambigüedad.
-const DIRECT_RESPONSE_THRESHOLD = 0.55;
-
-// Cuántas candidatas (ya ordenadas por similitud) se miran para un atajo
-// 'directo'. Así una ficha FAQ correcta en 2.º/3.º no pierde el atajo solo
-// porque otra NORMA irrelevante empató por milésimas en el 1.º.
-const DIRECT_RESPONSE_TOP_K = 3;
-
-// Holgura máxima respecto a la nº 1: sim_top1 - sim_directo. Si el mejor
-// 'directo' del top-K queda mucho por debajo del líder, no se fuerza el
-// atajo (el líder puede ser la respuesta correcta vía IA). ~0.02 cubre
-// empates tipo Emprendedor vs ruido; no deja pasar un directo flojo (0.56)
-// detrás de un top claro (0.70).
-const DIRECT_RESPONSE_MAX_GAP_FROM_TOP = 0.02;
-
-// Si las 2 mejores 'directo' empatan cerca, no forzar atajo: Claude elige
-// o pregunta (CONTACTO y resto de temáticas).
-const DIRECTO_AMBIGUITY_GAP = 0.03;
-
-// Tokens genéricos en nombres CONTACTO: no sirven para validar la entidad
-// ("Municipal" empataba Polideportivo/Biblioteca con "ayuntamiento").
-const CONTACT_STOPWORDS = new Set([
-  'municipal', 'municipales', 'servicio', 'servicios', 'concejalia',
-  'oficina', 'centro', 'local', 'alguazas', 'villa', 'reina',
-  // No son entidad: si "Teléfono…" va al inicio del subgrupo, no debe
-  // validar cualquier consulta de teléfono.
-  'telefono', 'horario', 'contacto', 'numero', 'llamar', 'centralita',
-  'atencion', 'publico', 'email', 'direccion', 'info',
-]);
-
-function normalizeContactText(text) {
-  return String(text || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{M}/gu, '');
-}
-
-function isContactPhoneRow(instr) {
-  const sub = normalizeContactText(instr.case_subgroup);
-  return sub.includes('telefono, contacto');
-}
-
-function contactEntityName(instr) {
-  const sub = String(instr.case_subgroup || '');
-  // Preferir el tramo "Nombre - teléfono…" aunque haya frases antes
-  // ("Teléfono del ayuntamiento. … Ayuntamiento de Alguazas - teléfono").
-  const dashTel = sub.match(/([^-]+?)\s*-\s*tel/i);
-  if (dashTel) return dashTel[1].replace(/^.*\.\s*/, '').trim();
-  return sub.trim();
-}
-
-function queryMentionsContactEntity(query, entityName) {
-  const q = normalizeContactText(query);
-  const name = normalizeContactText(entityName);
-  if (name && q.includes(name)) return true;
-  const tokens = name
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 4 && !CONTACT_STOPWORDS.has(t));
-  return tokens.some((t) => q.includes(t));
-}
-
-// True si hay ≥2 'directo' por encima del umbral y la 1ª y 2ª están a
-// menos de DIRECTO_AMBIGUITY_GAP (ranking inestable → mejor IA).
-function isAmbiguousDirectoCluster(directoPool) {
-  if (directoPool.length < 2) return false;
-  const sorted = [...directoPool].sort((a, b) => b.similarity - a.similarity);
-  return (sorted[0].similarity - sorted[1].similarity) < DIRECTO_AMBIGUITY_GAP;
-}
-
-// Elige atajo 'directo'.
-// - CONTACTO: además exige que la consulta nombre la entidad.
-// - Cualquier temática: si dos 'directo' empatan → no atajo (IA).
-function pickBestDirecto(instructions, citizenMessage) {
-  if (instructions.length === 1
-    && instructions[0].response_mode === 'directo') {
-    return { instr: instructions[0], reason: 'sole' };
-  }
-
-  const pool = instructions.filter((instr) => instr.response_mode === 'directo'
-    && instr.similarity >= DIRECT_RESPONSE_THRESHOLD);
-  if (pool.length === 0) return null;
-
-  // CONTACTO: priorizar filas cuya entidad aparece en la consulta.
-  const mentioned = pool.filter((instr) => !isContactPhoneRow(instr)
-    || queryMentionsContactEntity(citizenMessage, contactEntityName(instr)));
-
-  const ranked = (mentioned.length > 0 ? mentioned : pool)
-    .slice()
-    .sort((a, b) => b.similarity - a.similarity);
-
-  // Empate entre las dos mejores del conjunto elegido → Claude.
-  if (isAmbiguousDirectoCluster(ranked)) {
-    return null;
-  }
-
-  const best = ranked[0];
-  const topSim = instructions[0].similarity;
-
-  // Si llegamos por mención de entidad CONTACTO, aceptar aunque no sea la nº1
-  // global (p. ej. Ayuntamiento 3º, Polideportivo 1º).
-  if (mentioned.length > 0 && isContactPhoneRow(best)) {
-    return { instr: best, reason: 'contact_entity' };
-  }
-
-  if ((topSim - best.similarity) > DIRECT_RESPONSE_MAX_GAP_FROM_TOP) return null;
-  return { instr: best, reason: 'top' };
-}
 
 // Precio Claude Haiku 4.5 (USD / millón de tokens). Caché = ephemeral 5 min.
 const HAIKU_USD_PER_MTOK = {

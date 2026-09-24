@@ -36,7 +36,7 @@ async function handleIncomingMessage(chatId, text) {
       const routing = await getTelegramRouting(telegram.getBotId());
       if (!routing) {
         console.error('No se encontró una ruta activa para este bot de Telegram');
-        await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE);
+        await telegram.sendMessage(chatId, REFORMULATE_ANSWER);
         return;
       }
 
@@ -97,7 +97,7 @@ async function handleIncomingMessage(chatId, text) {
     const routing = await getTelegramRouting(telegram.getBotId());
     if (!routing) {
       console.error('No se encontró una ruta activa para este bot de Telegram');
-      await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE);
+      await telegram.sendMessage(chatId, REFORMULATE_ANSWER);
       return;
     }
 
@@ -120,7 +120,7 @@ async function handleIncomingMessage(chatId, text) {
     );
   } catch (err) {
     console.error('Error procesando mensaje de Telegram:', err);
-    await telegram.sendMessage(chatId, GENERIC_HANDOFF_MESSAGE).catch(() => {});
+    await telegram.sendMessage(chatId, REFORMULATE_ANSWER).catch(() => {});
   }
 }
 
