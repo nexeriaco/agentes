@@ -99,9 +99,19 @@ function scoreChunk(chunk, queryTokens) {
   return score;
 }
 
+// Título corto de FAQ (p. ej. «¿Cuál es el horario del Ecoparque?»): el
+// párrafo de respuesta suele ir en el chunk siguiente y a menudo puntúa
+// menos (no repite «horario»). Sin vecino, Claude solo ve el título.
+function looksLikeFaqTitle(chunk) {
+  const t = String(chunk || '').trim();
+  if (!t || t.length > 220) return false;
+  return /\?\s*$/.test(t) || /¿[^?]{3,180}\?/.test(t);
+}
+
 // Elige los trozos más alineados con la pregunta. Si la query no aporta
 // tokens o ningún chunk puntúa, cae al inicio del documento (comportamiento
-// previo). Conserva vecinos con http junto a chunks buenos.
+// previo). Conserva vecinos: enlaces http (trámites) y el chunk siguiente
+// tras un hit / título FAQ (respuesta Q&A).
 function selectRelevantExtracts(fullText, query) {
   const text = String(fullText || '');
   if (!text) return '';
@@ -134,8 +144,17 @@ function selectRelevantExtracts(fullText, query) {
     if (item.index > 0 && /https?:\/\//i.test(chunks[item.index - 1])) {
       candidates.unshift(item.index - 1);
     }
-    if (item.index < chunks.length - 1 && /https?:\/\//i.test(chunks[item.index + 1])) {
-      candidates.push(item.index + 1);
+    const nextIdx = item.index + 1;
+    if (nextIdx < chunks.length) {
+      const next = chunks[nextIdx];
+      // FAQ: título → respuesta. Enlaces: chunk siguiente con URL de trámite.
+      if (
+        looksLikeFaqTitle(item.chunk)
+        || /https?:\/\//i.test(next)
+        || item.score >= 2
+      ) {
+        candidates.push(nextIdx);
+      }
     }
 
     for (const idx of candidates) {
