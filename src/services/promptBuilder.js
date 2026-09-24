@@ -77,12 +77,26 @@ function buildEventsBlock(events, today) {
 // Parte FIJA del system prompt (tono, reglas, eventos de la ventana, tools).
 // Idéntica entre mensajes de la misma conversación el mismo día → cache_control.
 // Los casos semánticos van en buildInstructionsPrompt (sin cache_control).
-function buildFixedSystemPrompt(agent, events, today) {
+// Contactos por concejalía (escalation_contacts). Van en la parte fija:
+// son los mismos en toda la conversación, así que no rompen la caché.
+function buildEscalationContactsBlock(escalationContacts) {
+  if (!escalationContacts || escalationContacts.length === 0) {
+    return '(ninguna concejalía con contacto propio)';
+  }
+  return escalationContacts
+    .map((row) => `- ${row.case_group}: ${row.contact}`)
+    .join('\n');
+}
+
+function buildFixedSystemPrompt(agent, events, today, escalationContacts = []) {
   const tone = agent.tone_instructions
     ? agent.tone_instructions
     : '(sin instrucciones de tono adicionales)';
 
-  const ayuntamientoPhone = (agent.escalation_contact || DEFAULT_AYUNTAMIENTO_PHONE).trim();
+  // Contacto genérico: puede ser teléfono, email o una indicación en texto
+  // (p. ej. "Regístralo en el Registro de entrada…"), así que el prompt no
+  // lo presenta como teléfono.
+  const genericContact = (agent.escalation_contact || DEFAULT_AYUNTAMIENTO_PHONE).trim();
 
   // Prompt fijo acortado: una sola cascada de tools, reglas sin duplicar
   // task/examples, e historial aclarado (contexto sí, hechos nuevos no).
@@ -103,6 +117,7 @@ Fuentes de HECHOS solo de este turno:
 
 El historial del chat sirve para entender seguimientos ("¿y el teléfono?", "el segundo"), no para inventar datos nuevos. Si un dato concreto (teléfono, email, dirección, cifra, horario, fecha, nombre) no está literal en una fuente de este turno, no lo escribas —salvo que el ciudadano pida repetir un dato que tú ya diste en este hilo y sigue en el historial.
 No uses memoria del modelo ni conocimiento general como fuente.
+Excepción: los contactos de <escalation_contacts> puedes darlos, pero solo al aplicar <doc_miss>.
 </sources>
 
 <events>
@@ -122,10 +137,16 @@ PDF con texto → usa el texto. PDF escaneado (imágenes) → léelo; no digas a
 No abras URL/PDF solo para un contacto (teléfono, email, dirección, horario) si ya hay un caso CONTACTO con ese dato.
 </tools>
 
+<escalation_contacts>
+Contacto por concejalía (la "Concejalía" del caso del documento consultado):
+${buildEscalationContactsBlock(escalationContacts)}
+Contacto general (si la concejalía no está en la lista): ${genericContact}
+</escalation_contacts>
+
 <doc_miss>
-Tras abrir un documento/página de este turno:
-A) El dato pedido NO aparece en el extracto → NO uses ${HUMAN_HANDOFF_SENTINEL}. Responde en una o dos frases naturales: que no has encontrado esa información en el documento consultado, y que puede llamar al Ayuntamiento al ${ayuntamientoPhone}. Cierra con FUENTE:ninguna (o el ID del caso del documento si lo usaste).
-B) El texto remite a OTRO archivo/ordenanza/PDF (por nombre o URL) → dilo con claridad al ciudadano (nombre del documento y URL si aparece literal en la fuente). Si esa URL exacta está entre las legibles de este turno, ábrela con buscar_url. Si no puedes abrirla en este turno, indica el archivo/enlace y, si aún falta el dato, añade que puede llamar al ${ayuntamientoPhone}.
+Tras abrir un documento/página de este turno, el "contacto de derivación" es el de <escalation_contacts> para la Concejalía del caso de ese documento, o el general si no aparece. Cópialo tal cual; puede ser un email, un teléfono o una indicación, así que no digas "llamar" si no es un teléfono.
+A) El dato pedido NO aparece en el extracto → NO uses ${HUMAN_HANDOFF_SENTINEL}. Responde en una o dos frases naturales: que no has encontrado esa información en el documento consultado, y cómo puede contactar con la concejalía o el Ayuntamiento usando el contacto de derivación. Cierra con FUENTE:ninguna (o el ID del caso del documento si lo usaste).
+B) El texto remite a OTRO archivo/ordenanza/PDF (por nombre o URL) → dilo con claridad al ciudadano (nombre del documento y URL si aparece literal en la fuente). Si esa URL exacta está entre las legibles de este turno, ábrela con buscar_url. Si no puedes abrirla en este turno, indica el archivo/enlace y, si aún falta el dato, añade el contacto de derivación.
 No inventes nombres ni URLs de documentos que no salgan en las fuentes de este turno.
 </doc_miss>
 
@@ -192,7 +213,7 @@ FUENTE:(id del caso)</assistant>
 
 <example>
 <user>Abriste un PDF y el dato pedido no está en el extracto</user>
-<assistant>He consultado el documento disponible, pero no aparece esa información. Puedes llamar al Ayuntamiento al ${ayuntamientoPhone}.
+<assistant>He consultado el documento disponible, pero no aparece esa información. Puedes consultarlo con la concejalía en (contacto de derivación, tal cual).
 FUENTE:ninguna</assistant>
 </example>
 

@@ -2,6 +2,7 @@ const anthropic = require('../anthropic/client');
 const { getRelevantInstructions, matchInstructions } = require('./agentInstructions');
 const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
+const { getEscalationContacts } = require('./escalationContacts');
 const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
 const { buscarUrlConCache } = require('./urlCache');
 const { buildReadableUrlPolicy, isUrlAllowedByPolicy } = require('./urlGuard');
@@ -118,11 +119,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const [agent, events, history, directMatches] = await Promise.all([
+  const [agent, events, history, directMatches, escalationContacts] = await Promise.all([
     getAgent(agentId),
     getRelevantEvents(agentId, today),
     getRecentHistory(agentId, chatId),
     matchInstructions(agentId, citizenMessage),
+    getEscalationContacts(agentId),
   ]);
   const instructions = await getRelevantInstructions(
     agentId,
@@ -192,7 +194,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   const system = [
     {
       type: 'text',
-      text: buildFixedSystemPrompt(agent, events, today),
+      text: buildFixedSystemPrompt(agent, events, today, escalationContacts),
       cache_control: { type: 'ephemeral' },
     },
     {

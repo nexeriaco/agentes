@@ -1,6 +1,7 @@
 // Teléfono general del Ayuntamiento (directorio / página principal).
 // Se usa en el prompt cuando un documento no trae el dato.
-// Si el agente tiene escalation_contact, ese valor tiene prioridad.
+// Si el agente tiene escalation_contact, ese valor tiene prioridad, y las
+// concejalías con fila en escalation_contacts usan la suya.
 const DEFAULT_AYUNTAMIENTO_PHONE = '968 620 022';
 
 // Respuesta fija al ciudadano cuando no hay match claro o Claude marca
