@@ -173,6 +173,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       coste_usd: 0,
       modelo: null,
       motivo: 'agente_inactivo_o_inexistente',
+      historial_msgs: history.length,
     });
     return { answer: REFORMULATE_ANSWER };
   }
@@ -189,6 +190,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       coste_usd: 0,
       modelo: null,
       motivo: 'sin_instrucciones_ni_eventos',
+      historial_msgs: history.length,
     });
     return { answer: REFORMULATE_ANSWER };
   }
@@ -213,6 +215,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       tokens: emptyUsage(),
       coste_usd: 0,
       modelo: null,
+      historial_msgs: history.length,
     });
     return { answer: bestDirecto.instruction };
   }
@@ -340,6 +343,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       modelo: MODEL,
       tool_calls: toolCallCount,
       motivo: 'sentinel_reformular',
+      historial_msgs: history.length,
     });
     return { answer: REFORMULATE_ANSWER };
   }
@@ -357,6 +361,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     coste_usd: costeUsd,
     modelo: MODEL,
     tool_calls: toolCallCount,
+    historial_msgs: history.length,
   });
 
   return { answer };

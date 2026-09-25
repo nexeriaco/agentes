@@ -55,10 +55,24 @@ function oneLine(text) {
   return String(text).replace(/\s+/g, ' ').trim();
 }
 
-// Lecturas: buscar_url (pdf|link|error) o prefetch (cache); vacío → nada.
+// Lecturas de URL: prefetch desde tabla page_cache → "page_cache";
+// buscar_url en vivo → pdf|link|error. Vacío → nada (no confundir con historial).
 function formatUrlReadsLine(urlReads) {
   if (!urlReads || urlReads.length === 0) return 'nada';
-  return urlReads.map((r) => `${r.kind || 'link'} | ${r.url}`).join('  ;  ');
+  return urlReads
+    .map((r) => {
+      const kind = r.kind === 'cache' ? 'page_cache' : (r.kind || 'link');
+      return `${kind} | ${r.url}`;
+    })
+    .join('  ;  ');
+}
+
+// Mensajes previos inyectados desde conversation_history (no es page_cache).
+function formatHistorialLine(historialMsgs) {
+  if (historialMsgs == null) return null;
+  const n = Number(historialMsgs) || 0;
+  if (n <= 0) return 'vacío (sin conversation_history)';
+  return `${n} msgs | conversation_history`;
 }
 
 // Un id corto por consulta. Railway parte los \n en eventos distintos; si hay
@@ -69,8 +83,8 @@ function newConsultaLogId() {
 }
 
 // Orden de campos (estable): barra → cabecera modo/fecha → Consulta →
-// Respuesta → Fuente → Lectura → (Fuente raw) → (Motivo) → Candidatas →
-// Tokens → Coste → barra. Cada línea lleva el mismo [id].
+// Respuesta → Fuente → Lectura (page_cache/pdf) → Historial (conversation_history)
+// → (Fuente raw) → (Motivo) → Candidatas → Tokens → Coste → barra.
 function logConsulta(payload) {
   const bar = '='.repeat(72);
   const thin = '-'.repeat(72);
@@ -87,6 +101,11 @@ function logConsulta(payload) {
     `Fuente:     ${formatFuenteLine(payload.fuente)}`,
     `Lectura:    ${formatUrlReadsLine(payload.url_reads)}`,
   ];
+
+  const historialLine = formatHistorialLine(payload.historial_msgs);
+  if (historialLine) {
+    lines.push(`Historial:  ${historialLine}`);
+  }
 
   if (payload.fuente_raw != null) {
     lines.push(`Fuente raw: ${payload.fuente_raw}`);

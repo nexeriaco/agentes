@@ -5,3 +5,4 @@ node_modules/
 .claude/
 .venv/
 docs/informe-seguridad-medidas.md
+docs
