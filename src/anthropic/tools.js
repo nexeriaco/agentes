@@ -9,9 +9,9 @@ const BUSCAR_URL_TOOL = {
     '(no necesariamente el documento entero); úsalos igual para responder. ' +
     'Si es una página web, el texto incluye los enlaces marcados entre corchetes ' +
     'justo en el punto del texto donde aparecen, para poder identificar cuál corresponde a qué ' +
-    'tema o documento. Si es un PDF, devuelve el texto extraído del documento; si el PDF no tiene ' +
-    'texto extraíble (por ejemplo, por ser un escaneo), devuelve sus páginas como imágenes para que ' +
-    'las puedas leer visualmente. No se procesan documentos de más de 20MB.',
+    'tema o documento. Si es un PDF, se indexan como máximo las primeras 50 páginas de texto; ' +
+    'si el PDF no tiene texto extraíble (por ejemplo, por ser un escaneo), se envían hasta 8 ' +
+    'páginas como imágenes para lectura visual. No se procesan documentos de más de 20MB.',
   input_schema: {
     type: 'object',
     properties: {

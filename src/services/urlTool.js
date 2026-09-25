@@ -12,8 +12,11 @@ const MAX_CACHE_TEXT_CHARS = 200000;
 // Extracto máximo que se envía a Claude tras chunk + rank.
 const MAX_RETURN_CHARS = 4000;
 const TARGET_CHUNK_CHARS = 400;
-const TOP_CHUNKS = 5;
+// Tope de páginas de texto a indexar por PDF (el rank luego elige el
+// bloque útil). Documentos más largos se recortan a las primeras N.
+const MAX_PDF_PAGES = 50;
 const MIN_PDF_TEXT_CHARS = 40;
+// PDFs escaneados: cada página va como imagen a Claude (caro); límite bajo.
 const MAX_SCREENSHOT_PAGES = 8;
 
 const CACHE_V2_PREFIX = 'PAGE_CACHE_V2';
@@ -46,6 +49,38 @@ function tokenize(text) {
     .replace(/\p{M}/gu, '')
     .split(/[^\p{L}\p{N}]+/u)
     .filter((t) => t.length > 2);
+}
+
+// Sinónimos de búsqueda municipal: "precio" no aparece en muchas
+// ordenanzas (dicen tarifa/cuota/€); sin ampliar, el rank se queda en
+// el inicio del PDF donde solo hay definiciones.
+const QUERY_SYNONYMS = {
+  precio: ['tarifa', 'tarifas', 'cuota', 'importe', 'euros', 'euro', 'coste', 'costo', 'tasa'],
+  precios: ['tarifa', 'tarifas', 'cuota', 'cuotas', 'importe', 'euros', 'coste', 'tasa'],
+  cuesta: ['tarifa', 'cuota', 'importe', 'euros', 'coste', 'precio'],
+  coste: ['tarifa', 'cuota', 'precio', 'importe', 'euros', 'tasa'],
+  costo: ['tarifa', 'cuota', 'precio', 'importe', 'euros', 'tasa'],
+  importe: ['tarifa', 'cuota', 'precio', 'euros', 'tasa'],
+  tasa: ['tarifa', 'cuota', 'precio', 'importe', 'euros'],
+  tarifas: ['tarifa', 'cuota', 'precio', 'importe', 'euros'],
+  tarifa: ['cuota', 'precio', 'importe', 'euros', 'tasa'],
+  horario: ['horarios', 'hora', 'apertura', 'cierre', 'abre', 'cierra'],
+  horarios: ['horario', 'hora', 'apertura', 'cierre'],
+  telefono: ['tel', 'movil', 'contacto', 'llamada'],
+  email: ['correo', 'mail', 'e-mail', 'contacto'],
+};
+
+const PRICE_INTENT_RE = /\b(precio|precios|cuesta|coste|costo|importe|tarifa|tarifas|cuota|tasa|euros?)\b/i;
+
+function expandQueryTokens(tokens) {
+  const out = new Set(tokens);
+  for (const t of tokens) {
+    const syns = QUERY_SYNONYMS[t];
+    if (syns) {
+      for (const s of syns) out.add(s);
+    }
+  }
+  return [...out];
 }
 
 function splitIntoChunks(text) {
@@ -85,17 +120,36 @@ function splitIntoChunks(text) {
   return chunks;
 }
 
-function scoreChunk(chunk, queryTokens) {
-  const normalized = chunk
+function normalizeForMatch(text) {
+  return String(text || '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/\p{M}/gu, '');
+}
+
+function countEuroAmounts(chunk) {
+  // Regex local (sin /g compartido): evita lastIndex sucio entre llamadas.
+  const matches = String(chunk).match(/\d+[.,]\d{2}\s*€|\b\d+[.,]\d{2}\s*euros?\b|€\s*\d+/gi);
+  return matches ? matches.length : 0;
+}
+
+function scoreChunk(chunk, queryTokens, { priceIntent = false } = {}) {
+  const normalized = normalizeForMatch(chunk);
   let score = 0;
   for (const token of queryTokens) {
     if (normalized.includes(token)) score += 1;
   }
   // Ligero empujón a trozos con enlaces (trámites que necesitan el href).
   if (/https?:\/\//i.test(chunk)) score += 0.25;
+
+  const euroCount = countEuroAmounts(chunk);
+  if (priceIntent && euroCount > 0) {
+    // Tabla de tarifas: varios importes en el mismo trozo → muy prometedor.
+    score += Math.min(3, 0.75 + euroCount * 0.35);
+  }
+  if (priceIntent && /\btarifa\s*\d+\b/i.test(chunk)) score += 1.25;
+  if (priceIntent && /cuota tributaria/i.test(chunk)) score += 1.5;
+
   return score;
 }
 
@@ -108,77 +162,160 @@ function looksLikeFaqTitle(chunk) {
   return /\?\s*$/.test(t) || /¿[^?]{3,180}\?/.test(t);
 }
 
-// Elige los trozos más alineados con la pregunta. Si la query no aporta
-// tokens o ningún chunk puntúa, cae al inicio del documento (comportamiento
-// previo). Conserva vecinos: enlaces http (trámites) y el chunk siguiente
-// tras un hit / título FAQ (respuesta Q&A).
+function clipExtract(text) {
+  if (text.length <= MAX_RETURN_CHARS) return text;
+  return `${text.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`;
+}
+
+// Agrupa índices contiguos en clusters { start, end, scoreSum, peak }.
+function buildClusters(seedIndexes, scoresByIndex) {
+  const sorted = [...seedIndexes].sort((a, b) => a - b);
+  if (sorted.length === 0) return [];
+
+  const clusters = [];
+  let start = sorted[0];
+  let end = sorted[0];
+  let scoreSum = scoresByIndex[sorted[0]] || 0;
+  let peak = scoreSum;
+
+  for (let i = 1; i < sorted.length; i += 1) {
+    const idx = sorted[i];
+    if (idx === end + 1) {
+      end = idx;
+      const s = scoresByIndex[idx] || 0;
+      scoreSum += s;
+      if (s > peak) peak = s;
+    } else {
+      clusters.push({ start, end, scoreSum, peak });
+      start = idx;
+      end = idx;
+      scoreSum = scoresByIndex[idx] || 0;
+      peak = scoreSum;
+    }
+  }
+  clusters.push({ start, end, scoreSum, peak });
+  return clusters;
+}
+
+function clusterPromise(cluster) {
+  // Preferir pico alto (tabla de tarifas) y, a igualdad, mayor masa útil.
+  return cluster.peak * 1000 + cluster.scoreSum;
+}
+
+// Expande un cluster hacia vecinos útiles (continuación de tabla / FAQ /
+// enlaces) sin pasar MAX_RETURN_CHARS.
+function expandCluster(cluster, chunks, scoresByIndex, priceIntent) {
+  let start = cluster.start;
+  let end = cluster.end;
+  let usedChars = 0;
+  for (let i = start; i <= end; i += 1) usedChars += chunks[i].length + (i > start ? 2 : 0);
+
+  const canAdd = (idx) => {
+    if (idx < 0 || idx >= chunks.length) return false;
+    const nextLen = chunks[idx].length + 2;
+    return usedChars + nextLen <= MAX_RETURN_CHARS;
+  };
+
+  const isUsefulNeighbor = (idx) => {
+    const s = scoresByIndex[idx] || 0;
+    if (s > 0) return true;
+    if (looksLikeFaqTitle(chunks[idx])) return true;
+    if (/https?:\/\//i.test(chunks[idx])) return true;
+    if (priceIntent && (countEuroAmounts(chunks[idx]) > 0 || /\btarifa\s*\d+\b/i.test(chunks[idx]))) {
+      return true;
+    }
+    return false;
+  };
+
+  let grew = true;
+  while (grew) {
+    grew = false;
+    if (canAdd(end + 1) && isUsefulNeighbor(end + 1)) {
+      end += 1;
+      usedChars += chunks[end].length + 2;
+      grew = true;
+    }
+    if (canAdd(start - 1) && isUsefulNeighbor(start - 1)) {
+      start -= 1;
+      usedChars += chunks[start].length + 2;
+      grew = true;
+    }
+  }
+
+  // Si aún cabe presupuesto y el pico es una tabla (€), seguir un poco
+  // hacia adelante aunque el score del vecino sea 0 (líneas de tarifa
+  // partidas sin repetir "vado"/"precio").
+  while (
+    priceIntent
+    && canAdd(end + 1)
+    && countEuroAmounts(chunks[end]) > 0
+    && (countEuroAmounts(chunks[end + 1]) > 0 || /\btarifa\s*\d+\b/i.test(chunks[end + 1]))
+  ) {
+    end += 1;
+    usedChars += chunks[end].length + 2;
+  }
+
+  return { start, end };
+}
+
+// Recorre TODO el documento (chunk a chunk), puntúa cada trozo con la
+// consulta ampliada por sinónimos, agrupa hits contiguos y se queda solo
+// con el cluster más prometedor (ahorro de tokens). Si no hay señal útil,
+// cae al inicio del documento.
 function selectRelevantExtracts(fullText, query) {
   const text = String(fullText || '');
   if (!text) return '';
 
-  const queryTokens = [...new Set(tokenize(query || ''))];
-  if (queryTokens.length === 0) {
-    return text.length > MAX_RETURN_CHARS
-      ? `${text.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`
-      : text;
+  const rawTokens = [...new Set(tokenize(query || ''))];
+  if (rawTokens.length === 0) {
+    return clipExtract(text);
   }
 
+  const queryTokens = expandQueryTokens(rawTokens);
+  const priceIntent = PRICE_INTENT_RE.test(String(query || ''));
   const chunks = splitIntoChunks(text);
   if (chunks.length === 0) return '';
 
-  const scored = chunks.map((chunk, index) => ({
-    chunk,
-    index,
-    score: scoreChunk(chunk, queryTokens),
-  }));
-  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  // Puntuar el documento entero: no se corta la búsqueda a los primeros N.
+  const scoresByIndex = chunks.map((chunk) => scoreChunk(chunk, queryTokens, { priceIntent }));
+  let maxScore = 0;
+  for (const s of scoresByIndex) {
+    if (s > maxScore) maxScore = s;
+  }
 
-  const selectedIndexes = new Set();
-  let usedChars = 0;
-
-  for (const item of scored) {
-    if (item.score <= 0) break;
-    if (selectedIndexes.size >= TOP_CHUNKS) break;
-
-    const candidates = [item.index];
-    if (item.index > 0 && /https?:\/\//i.test(chunks[item.index - 1])) {
-      candidates.unshift(item.index - 1);
-    }
-    const nextIdx = item.index + 1;
-    if (nextIdx < chunks.length) {
-      const next = chunks[nextIdx];
-      // FAQ: título → respuesta. Enlaces: chunk siguiente con URL de trámite.
-      if (
-        looksLikeFaqTitle(item.chunk)
-        || /https?:\/\//i.test(next)
-        || item.score >= 2
-      ) {
-        candidates.push(nextIdx);
-      }
-    }
-
-    for (const idx of candidates) {
-      if (selectedIndexes.has(idx)) continue;
-      const nextLen = chunks[idx].length + (usedChars > 0 ? 2 : 0);
-      if (usedChars + nextLen > MAX_RETURN_CHARS && selectedIndexes.size > 0) continue;
-      selectedIndexes.add(idx);
-      usedChars += nextLen;
-      if (selectedIndexes.size >= TOP_CHUNKS + 2) break;
+  // Intent de precio sin hits léxicos: segunda pasada solo por importes €.
+  if (maxScore <= 0 && priceIntent) {
+    for (let i = 0; i < chunks.length; i += 1) {
+      const euros = countEuroAmounts(chunks[i]);
+      if (euros > 0) scoresByIndex[i] = 0.5 + euros * 0.35;
+      if (scoresByIndex[i] > maxScore) maxScore = scoresByIndex[i];
     }
   }
 
-  if (selectedIndexes.size === 0) {
-    return text.length > MAX_RETURN_CHARS
-      ? `${text.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`
-      : text;
+  if (maxScore <= 0) {
+    return clipExtract(text);
   }
 
-  const ordered = [...selectedIndexes].sort((a, b) => a - b);
-  let extract = ordered.map((i) => chunks[i]).join('\n\n---\n\n');
-  if (extract.length > MAX_RETURN_CHARS) {
-    extract = `${extract.slice(0, MAX_RETURN_CHARS)}\n[...contenido recortado...]`;
+  // Semillas: lo más cercano al pico (no el inicio del PDF por empate débil).
+  const seedThreshold = Math.max(maxScore * 0.55, maxScore - 1.5);
+  const seedIndexes = [];
+  for (let i = 0; i < scoresByIndex.length; i += 1) {
+    if (scoresByIndex[i] >= seedThreshold && scoresByIndex[i] > 0) {
+      seedIndexes.push(i);
+    }
   }
-  return extract;
+
+  const clusters = buildClusters(seedIndexes, scoresByIndex);
+  if (clusters.length === 0) {
+    return clipExtract(text);
+  }
+
+  clusters.sort((a, b) => clusterPromise(b) - clusterPromise(a));
+  const best = expandCluster(clusters[0], chunks, scoresByIndex, priceIntent);
+
+  const parts = [];
+  for (let i = best.start; i <= best.end; i += 1) parts.push(chunks[i]);
+  return clipExtract(parts.join('\n\n---\n\n'));
 }
 
 function buildClaudeText(url, kind, fullText, query) {
@@ -304,15 +441,24 @@ function handleHtml(buffer) {
 async function handlePdf(buffer) {
   const parser = new PDFParse({ data: buffer });
   try {
-    const { text } = await parser.getText();
+    const info = await parser.getInfo();
+    const totalPages = info.total || 1;
+    const pagesToRead = Math.min(totalPages, MAX_PDF_PAGES);
+    const truncated = totalPages > MAX_PDF_PAGES;
+
+    // first+last = rango inclusivo (páginas 1..pagesToRead).
+    const { text } = await parser.getText({ first: 1, last: pagesToRead });
     const trimmed = (text || '').trim();
 
     if (trimmed.length >= MIN_PDF_TEXT_CHARS) {
-      return { kind: 'pdf', fullText: clipForCache(trimmed) };
+      let fullText = clipForCache(trimmed);
+      if (truncated) {
+        fullText += `\n\n[Documento de ${totalPages} páginas: solo se han indexado las primeras ${MAX_PDF_PAGES}.]`;
+      }
+      return { kind: 'pdf', fullText };
     }
 
-    const info = await parser.getInfo();
-    const totalPages = info.total || 1;
+    // Escaneado: pocas páginas como imagen (coste de visión).
     const lastPage = Math.min(totalPages, MAX_SCREENSHOT_PAGES);
     const screenshot = await parser.getScreenshot({ first: 1, last: lastPage });
 
@@ -407,4 +553,6 @@ module.exports = {
   buscarUrl,
   toClaudeResult,
   unpackFullTextCache,
+  // Expuesto para pruebas / scripts de diagnóstico del rank.
+  selectRelevantExtracts,
 };
