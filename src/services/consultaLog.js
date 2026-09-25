@@ -55,7 +55,7 @@ function oneLine(text) {
   return String(text).replace(/\s+/g, ' ').trim();
 }
 
-// Lecturas reales vía buscar_url: pdf | link | error; vacío → nada.
+// Lecturas: buscar_url (pdf|link|error) o prefetch (cache); vacío → nada.
 function formatUrlReadsLine(urlReads) {
   if (!urlReads || urlReads.length === 0) return 'nada';
   return urlReads.map((r) => `${r.kind || 'link'} | ${r.url}`).join('  ;  ');

@@ -4,7 +4,7 @@ const { getAgent } = require('./agents');
 const { getRelevantEvents } = require('./agentEvents');
 const { getEscalationContacts } = require('./escalationContacts');
 const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
-const { buscarUrlConCache } = require('./urlCache');
+const { buscarUrlConCache, tryServeFromCacheOnly } = require('./urlCache');
 const { buildReadableUrlPolicy, isUrlAllowedByPolicy } = require('./urlGuard');
 const { getRecentHistory } = require('./conversationHistory');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('./politeClosing');
@@ -92,6 +92,33 @@ function extractFuente(rawText, instructions, events) {
     fuente: instr ? summarizeInstruction(instr) : { tabla: 'agent_instructions', id: raw },
     fuente_raw: raw,
   };
+}
+
+// URLs asociadas legibles de este turno (fichas + eventos).
+function collectAssociatedReadableUrls(instructions = [], events = []) {
+  const urls = [];
+  for (const instr of instructions) {
+    if (instr.allow_url_reading && instr.associated_url) {
+      const u = String(instr.associated_url).trim();
+      if (u) urls.push(u);
+    }
+  }
+  for (const ev of events) {
+    if (ev.allow_url_reading && ev.url) {
+      const u = String(ev.url).trim();
+      if (u) urls.push(u);
+    }
+  }
+  return [...new Set(urls)];
+}
+
+// Prefetch en paralelo desde page_cache (solo texto; sin fetch).
+async function prefetchReadableDocs(agentId, urls, query) {
+  if (!urls.length) return [];
+  const results = await Promise.all(
+    urls.map((url) => tryServeFromCacheOnly(agentId, url, query).catch(() => null))
+  );
+  return results.filter(Boolean);
 }
 
 // Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
@@ -188,9 +215,13 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con
   // cache_control: idéntico entre mensajes de una misma conversación, así
   // que a partir del segundo mensaje se lee de caché en vez de reescribirse.
-  // Bloque dinámico (casos seleccionados para esta pregunta) sin
+  // Bloque dinámico (casos + extractos prefetched de page_cache) sin
   // cache_control, después del breakpoint: cambia cada mensaje pero no
   // invalida la caché del bloque fijo que lo precede.
+  const associatedUrls = collectAssociatedReadableUrls(instructions, events);
+  const prefetched = await prefetchReadableDocs(agentId, associatedUrls, citizenMessage);
+  const prefetchedUrlSet = new Set(prefetched.map((doc) => doc.url));
+
   const system = [
     {
       type: 'text',
@@ -199,15 +230,20 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     },
     {
       type: 'text',
-      text: buildInstructionsPrompt(instructions),
+      text: buildInstructionsPrompt(instructions, prefetched),
     },
   ];
   const urlPolicy = buildReadableUrlPolicy(instructions, events);
   const hasReadableUrls = urlPolicy.exactUrls.size > 0;
+  // Tool si falta prefetch en alguna URL asociada, o si ya hay prefetch
+  // (por si hace falta un 2.º PDF del mismo sitio vía cascada).
+  const needsToolForMiss = associatedUrls.some((url) => !prefetchedUrlSet.has(url));
+  const mayNeedToolForCascade = prefetched.length > 0 && urlPolicy.hosts.size > 0;
+  const allowUrlTool = hasReadableUrls && (needsToolForMiss || mayNeedToolForCascade);
 
   const messages = [...history, { role: 'user', content: citizenMessage }];
   let toolCallCount = 0;
-  const urlReads = [];
+  const urlReads = prefetched.map((doc) => ({ url: doc.url, kind: 'cache' }));
   let text = '';
   const usageTotals = emptyUsage();
 
@@ -216,7 +252,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   // Al agotar el margen se deja de ofrecer la tool, lo que fuerza una
   // respuesta final en texto y garantiza que el bucle termina.
   while (true) {
-    const offerTool = hasReadableUrls && toolCallCount < MAX_TOOL_CALLS;
+    const offerTool = allowUrlTool && toolCallCount < MAX_TOOL_CALLS;
 
     const response = await anthropic.messages.create({
       model: MODEL,
@@ -247,6 +283,15 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
           content: [{
             type: 'text',
             text: `URL no permitida: solo se pueden abrir URLs asociadas a un caso o evento de este turno (o un documento del mismo sitio).`,
+          }],
+        };
+      } else if (prefetchedUrlSet.has(String(requestedUrl || '').trim())) {
+        // Ya inyectado en el prompt: no re-fetch; recuerdo corto al modelo.
+        result = {
+          kind: 'cache',
+          content: [{
+            type: 'text',
+            text: `Esa URL ya está en <prefetched_docs>. Usa el extracto del system prompt; no hace falta volver a descargarla.`,
           }],
         };
       } else {

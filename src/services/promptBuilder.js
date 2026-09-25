@@ -113,7 +113,8 @@ ${tone}
 Fuentes de HECHOS solo de este turno:
 1. Casos de <relevant_cases> que apliquen de verdad.
 2. Eventos de <events> que nombren explícitamente el mismo lugar, servicio o tema.
-3. Resultado de buscar_url en este turno (puede ser extracto filtrado): no inventes nada que no aparezca ahí.
+3. Contenido de <prefetched_docs> (extractos ya leídos de páginas/PDFs en caché): úsalos igual que un resultado de buscar_url.
+4. Resultado de buscar_url en este turno (puede ser extracto filtrado): no inventes nada que no aparezca ahí.
 
 El historial del chat sirve para entender seguimientos ("¿y el teléfono?", "el segundo"), no para inventar datos nuevos. Si un dato concreto (teléfono, email, dirección, cifra, horario, fecha, nombre) no está literal en una fuente de este turno, no lo escribas —salvo que el ciudadano pida repetir un dato que tú ya diste en este hilo y sigue en el historial.
 No uses memoria del modelo ni conocimiento general como fuente.
@@ -128,11 +129,13 @@ ${buildEventsBlock(events, today)}
 
 <tools>
 buscar_url: solo URLs con "puedes leer su contenido". Si dice "solo puedes compartirla", menciona la URL y no la abras.
+Si una URL ya aparece en <prefetched_docs>, NO llames buscar_url para esa URL: usa el extracto de ahí.
 Cascada (no saltes):
 1. Texto del caso/evento si ya cubre la pregunta.
-2. Si falta info y la URL es legible → buscar_url en esa página/PDF.
-3. Si en el resultado aparece un PDF/doc concreto relacionado → segunda llamada con esa URL exacta (nunca inventada).
-4. Si aún no hay base → aplica <doc_miss> o <fallback> según el caso.
+2. Si falta info y el extracto está en <prefetched_docs> → úsalo (no abras de nuevo).
+3. Si falta info y la URL es legible pero NO está en <prefetched_docs> → buscar_url en esa página/PDF.
+4. Si en el resultado (o en prefetched) aparece un PDF/doc concreto relacionado → segunda llamada con esa URL exacta (nunca inventada), salvo que ya esté en <prefetched_docs>.
+5. Si aún no hay base → aplica <doc_miss> o <fallback> según el caso.
 PDF con texto → usa el texto. PDF escaneado (imágenes) → léelo; no digas al ciudadano que es un escaneo.
 No abras URL/PDF solo para un contacto (teléfono, email, dirección, horario) si ya hay un caso CONTACTO con ese dato.
 </tools>
@@ -146,7 +149,7 @@ Contacto general (si la concejalía no está en la lista): ${genericContact}
 <doc_miss>
 Tras abrir un documento/página de este turno, el "contacto de derivación" es el de <escalation_contacts> para la Concejalía del caso de ese documento, o el general si no aparece. Cópialo tal cual; puede ser un email, un teléfono o una indicación, así que no digas "llamar" si no es un teléfono.
 A) El dato pedido NO aparece en el extracto → NO uses ${HUMAN_HANDOFF_SENTINEL}. Responde en una o dos frases naturales: que no has encontrado esa información en el documento consultado, y cómo puede contactar con la concejalía o el Ayuntamiento usando el contacto de derivación. Cierra con FUENTE:ninguna (o el ID del caso del documento si lo usaste).
-B) El texto remite a OTRO archivo/ordenanza/PDF (por nombre o URL) → dilo con claridad al ciudadano (nombre del documento y URL si aparece literal en la fuente). Si esa URL exacta está entre las legibles de este turno, ábrela con buscar_url. Si no puedes abrirla en este turno, indica el archivo/enlace y, si aún falta el dato, añade el contacto de derivación.
+B) El texto remite a OTRO archivo/ordenanza/PDF (por nombre o URL) → dilo con claridad al ciudadano (nombre del documento y URL si aparece literal en la fuente). Si esa URL exacta está en <prefetched_docs>, úsala. Si está entre las legibles de este turno y no está prefetched, ábrela con buscar_url. Si no puedes abrirla en este turno, indica el archivo/enlace y, si aún falta el dato, añade el contacto de derivación.
 No inventes nombres ni URLs de documentos que no salgan en las fuentes de este turno.
 </doc_miss>
 
@@ -232,18 +235,40 @@ FUENTE:(id del caso leído)</assistant>
 </task>`;
 }
 
-// Parte DINÁMICA: casos semánticos de este mensaje (sin cache_control).
-function buildInstructionsPrompt(instructions) {
-  if (instructions.length === 0) {
-    return `<relevant_cases>
-Ninguno con similitud suficiente.
-</relevant_cases>`;
+// Parte DINÁMICA: casos semánticos de este mensaje (sin cache_control)
+// + extractos de page_cache ya rankeados (prefetch; evita buscar_url).
+function buildPrefetchedDocsBlock(prefetched) {
+  if (!prefetched || prefetched.length === 0) {
+    return `<prefetched_docs>
+Ninguno en este turno.
+</prefetched_docs>`;
   }
-  return `<relevant_cases>
+
+  const body = prefetched
+    .map((doc) => `URL: ${doc.url}\n${doc.text}`)
+    .join('\n\n---\n\n');
+
+  return `<prefetched_docs>
+Extractos ya leídos de la caché (equivalen a un resultado de buscar_url). Úsalos como fuente de hechos; no vuelvas a abrir estas URLs.
+
+${body}
+</prefetched_docs>`;
+}
+
+function buildInstructionsPrompt(instructions, prefetched = []) {
+  const casesBlock = instructions.length === 0
+    ? `<relevant_cases>
+Ninguno con similitud suficiente.
+</relevant_cases>`
+    : `<relevant_cases>
 Casos más relevantes; úsalos solo si aplican de verdad. Prefijos CONTACTO · / TRÁMITE · / NORMA · → <intent>.
 
 ${buildInstructionsBlock(instructions)}
 </relevant_cases>`;
+
+  return `${casesBlock}
+
+${buildPrefetchedDocsBlock(prefetched)}`;
 }
 
 module.exports = {

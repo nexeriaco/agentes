@@ -93,6 +93,46 @@ function isLegacyCache(cachedContent) {
   return Boolean(unpacked && unpacked.legacy);
 }
 
+// Extrae texto plano de un tool_result (bloques text). Sin texto → null
+// (p.ej. PDF escaneado solo con imágenes: no sirve para prefetch al prompt).
+function extractTextFromContent(content) {
+  if (!Array.isArray(content) || content.length === 0) return null;
+  if (content.some((block) => block.type === 'image')) return null;
+  const parts = content
+    .filter((block) => block.type === 'text' && block.text)
+    .map((block) => block.text);
+  const text = parts.join('\n\n').trim();
+  return text || null;
+}
+
+// Solo lectura de page_cache + rank: sin fetch. Para inyectar extractos en
+// el prompt y evitar buscar_url cuando el PDF/página ya está cacheado.
+// Devuelve null si no hay hit, caché legacy, error, o solo imágenes.
+async function tryServeFromCacheOnly(agentId, url, query = '') {
+  const cached = await getCachedContent(agentId, url);
+  if (!cached || isLegacyCache(cached)) return null;
+
+  const unpacked = unpackFullTextCache(cached);
+  if (unpacked && unpacked.content && !unpacked.fullText) {
+    // PDF escaneado (imágenes) o error empaquetado sin fullText.
+    return null;
+  }
+  if (unpacked && unpacked.kind === 'error') return null;
+
+  const served = serveFromCache(url, cached, query);
+  if (!served || served.kind === 'error') return null;
+
+  const text = extractTextFromContent(served.content);
+  if (!text) return null;
+
+  return {
+    url,
+    kind: served.kind || 'link',
+    content: served.content,
+    text,
+  };
+}
+
 // Envoltorio de buscarUrl con caché: guarda el texto COMPLETO de la URL;
 // el filtrado por pregunta (chunk + rank) se aplica al servir, para que
 // distintas consultas sobre la misma página obtengan extractos distintos.
@@ -114,4 +154,4 @@ async function buscarUrlConCache(agentId, url, query = '', policy = null) {
   return { content: result.content, kind: result.kind || 'link' };
 }
 
-module.exports = { buscarUrlConCache };
+module.exports = { buscarUrlConCache, tryServeFromCacheOnly };
