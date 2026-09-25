@@ -145,6 +145,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   }
 
   const today = new Date().toISOString().slice(0, 10);
+  const retrievalMeta = {};
 
   const [agent, events, history, directMatches, escalationContacts] = await Promise.all([
     getAgent(agentId),
@@ -157,7 +158,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     agentId,
     citizenMessage,
     history,
-    { directMatches }
+    { directMatches, retrievalMeta }
   );
 
   if (!agent) {
@@ -194,7 +195,11 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   // Atajo 'directo': FAQs claras sin Claude. En CONTACTO exige que la
   // consulta nombre la entidad (evita Polideportivo con "ayuntamiento").
-  const picked = pickBestDirecto(instructions, citizenMessage);
+  // Tras una aclaración del bot, no atajar: la respuesta corta del ciudadano
+  // ("escuelas infantiles") no debe caer en un CONTACTO suelto.
+  const picked = retrievalMeta.clarificationFollowUp
+    ? null
+    : pickBestDirecto(instructions, citizenMessage);
   const bestDirecto = picked && picked.instr;
 
   if (bestDirecto) {
@@ -219,7 +224,15 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   // cache_control, después del breakpoint: cambia cada mensaje pero no
   // invalida la caché del bloque fijo que lo precede.
   const associatedUrls = collectAssociatedReadableUrls(instructions, events);
-  const prefetched = await prefetchReadableDocs(agentId, associatedUrls, citizenMessage);
+  // Rank de PDF: si venimos de aclaración, usar «pregunta previa + respuesta».
+  let prefetchQuery = citizenMessage;
+  if (retrievalMeta.clarificationFollowUp) {
+    const prevUser = [...history].reverse().find((m) => m.role === 'user');
+    if (prevUser && prevUser.content) {
+      prefetchQuery = `${prevUser.content}\n${citizenMessage}`;
+    }
+  }
+  const prefetched = await prefetchReadableDocs(agentId, associatedUrls, prefetchQuery);
   const prefetchedUrlSet = new Set(prefetched.map((doc) => doc.url));
 
   const system = [
@@ -295,7 +308,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
           }],
         };
       } else {
-        result = await buscarUrlConCache(agentId, requestedUrl, citizenMessage, urlPolicy);
+        result = await buscarUrlConCache(agentId, requestedUrl, prefetchQuery, urlPolicy);
       }
       urlReads.push({ url: requestedUrl, kind: result.kind || 'link' });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result.content });

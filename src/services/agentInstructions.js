@@ -22,9 +22,21 @@ const SIMILARITY_THRESHOLD = 0.4;
 // el bot `directo` hacía ganar plenos a "farola rota" con sim ~0.72).
 const TOPIC_CONTINUITY_THRESHOLD = 0.5;
 
+// Si el match solo del mensaje nuevo gana al combo por este margen y es
+// otra ficha → se trata como cambio de tema (no forzar aclaración).
+const CLARIFICATION_TOPIC_ESCAPE_GAP = 0.08;
+
 // Señales de seguimiento respecto al turno anterior (no temas nuevos cortos).
 const FOLLOWUP_PREFIX =
   /^(¿?\s*y\b|sí\b|si\b|ok\b|vale\b|ese\b|esa\b|eso\b|esos\b|esas\b|el\s+primero|el\s+segundo|la\s+primera|la\s+segunda|más\s+info|más\s+detalles|y\s+eso|también\b|entonces\b|pero\b|sobre\s+eso|de\s+eso|lo\s+mismo)/i;
+
+// Último mensaje del bot parece una aclaración (FUENTE ya no está en historial).
+const BOT_CLARIFICATION_RE =
+  /¿[^?\n]{3,220}\?|\?\s*$|te refieres|necesitas.{0,80}\bo\b|a otro|o a |cuál de|cual de|¿a o b\b/i;
+
+// Pregunta nueva autocontenida: no forzar modo aclaración.
+const STANDALONE_QUESTION_RE =
+  /^(¿?\s*)(cuál|cual|cuánto|cuanto|dónde|donde|cómo|como|qué|que|quién|quien|horario|teléfono|telefono|email|correo|precio|precios|cuánto\s+cuesta|cuanto\s+cuesta)\b/i;
 
 // Dado un agentId y un texto de búsqueda ya resuelto, devuelve las
 // instrucciones activas de ese agente semánticamente más relevantes
@@ -74,6 +86,40 @@ function findLastByRole(history, role) {
   return null;
 }
 
+function looksLikeBotClarification(assistantText) {
+  const text = String(assistantText || '').trim();
+  if (!text) return false;
+  return BOT_CLARIFICATION_RE.test(text);
+}
+
+function looksLikeStandaloneQuestion(message) {
+  const text = String(message || '').trim();
+  if (!text) return false;
+  if (text.length >= 40) return true;
+  if (STANDALONE_QUESTION_RE.test(text) && text.length >= 25) return true;
+  return false;
+}
+
+// Tras una aclaración del bot: ¿forzar enriquecer con el mensaje USER previo?
+function isAwaitingClarificationReply(history, citizenMessage) {
+  const lastAssistant = findLastByRole(history, 'assistant');
+  const lastUser = findLastByRole(history, 'user');
+  if (!lastAssistant || !lastUser) return false;
+  if (!looksLikeBotClarification(lastAssistant.content)) return false;
+  if (looksLikeStandaloneQuestion(citizenMessage)) return false;
+  return true;
+}
+
+// Cambio de tema: el mensaje solo gana claro al combo y apunta a otra ficha.
+function shouldPreferAloneOverEnriched(aloneMatches, enrichedMatches) {
+  if (!aloneMatches.length) return false;
+  if (!enrichedMatches.length) return true;
+  const aloneTop = aloneMatches[0];
+  const enrichedTop = enrichedMatches[0];
+  if (String(aloneTop.id) === String(enrichedTop.id)) return false;
+  return aloneTop.similarity >= enrichedTop.similarity + CLARIFICATION_TOPIC_ESCAPE_GAP;
+}
+
 async function isSameTopicAsPreviousUser(citizenMessage, previousUserMessage) {
   const [currentEmb, previousEmb] = await embedQueries([
     citizenMessage,
@@ -85,8 +131,11 @@ async function isSameTopicAsPreviousUser(citizenMessage, previousUserMessage) {
 // Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
 // reciente de la conversación, devuelve las instrucciones más relevantes.
 //
+// 0. Si el bot acaba de pedir aclaración y el ciudadano responde corto:
+//    buscar con «último USER + mensaje actual» (salvo escape por tema nuevo).
+//    options.retrievalMeta.clarificationFollowUp = true si se aplica.
 // 1. Siempre buscar solo con el mensaje actual. Si hay matches >= umbral,
-//    usarlos (tema autocontenido; no mezclar historial).
+//    usarlos (tema autocontenido; no mezclar historial) — salvo paso 0.
 // 2. Si el match directo está vacío, enriquecer SOLO si parece follow-up:
 //    - cue léxico ("¿y el teléfono?", "sí", "ese", "el segundo"…), o
 //    - mismo tema que el último mensaje del ciudadano (sim embedding >=
@@ -95,12 +144,32 @@ async function isSameTopicAsPreviousUser(citizenMessage, previousUserMessage) {
 //    texto `directo` del bot (envenena el embedding; staging: plenos →
 //    "farola rota" devolvía plenos con sim ~0.72).
 async function getRelevantInstructions(agentId, citizenMessage, history = [], options = {}) {
+  const retrievalMeta = options.retrievalMeta || {};
+  retrievalMeta.clarificationFollowUp = false;
+
   const directMatches = options.directMatches !== undefined
     ? options.directMatches
     : await matchInstructions(agentId, citizenMessage);
-  if (directMatches.length > 0) return directMatches;
 
   const lastUserMessage = findLastByRole(history, 'user');
+
+  if (isAwaitingClarificationReply(history, citizenMessage) && lastUserMessage) {
+    const enrichedMatches = await matchInstructions(
+      agentId,
+      `${lastUserMessage.content}\n${citizenMessage}`
+    );
+
+    if (!shouldPreferAloneOverEnriched(directMatches, enrichedMatches)) {
+      if (enrichedMatches.length > 0) {
+        retrievalMeta.clarificationFollowUp = true;
+        return enrichedMatches;
+      }
+    }
+    // Escape / sin hits en combo: seguir con lógica normal (directMatches).
+  }
+
+  if (directMatches.length > 0) return directMatches;
+
   if (!lastUserMessage) return directMatches;
 
   let enrichWithPreviousUser = isLexicalFollowUp(citizenMessage);
@@ -121,4 +190,6 @@ async function getRelevantInstructions(agentId, citizenMessage, history = [], op
 module.exports = {
   getRelevantInstructions,
   matchInstructions,
+  isAwaitingClarificationReply,
+  looksLikeBotClarification,
 };
