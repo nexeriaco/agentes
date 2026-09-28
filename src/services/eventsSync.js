@@ -55,9 +55,46 @@ function rowToEvent(headers, row, agentId) {
   return event;
 }
 
-// Lee todas las filas de la hoja indicada en GOOGLE_SHEET_ID y hace upsert
-// en agent_events para el agentId dado (conflicto por agent_id+title+
-// start_date, ya que la hoja no trae un ID propio por fila).
+// Misma clave lógica que el UNIQUE (agent_id, title, start_date).
+function eventKey(title, startDate) {
+  const start = startDate ? String(startDate).slice(0, 10) : '';
+  return `${title}|${start}`;
+}
+
+// Desactiva filas del agente que ya no aparecen en la hoja (reconcile).
+// No borra: active=false las saca del prompt (getRelevantEvents filtra active).
+async function deactivateMissingEvents(agentId, sheetEvents) {
+  const kept = new Set(sheetEvents.map((event) => eventKey(event.title, event.start_date)));
+
+  const { data: existing, error } = await supabase
+    .from('agent_events')
+    .select('id, title, start_date')
+    .eq('agent_id', agentId)
+    .eq('active', true);
+
+  if (error) throw error;
+
+  const toDeactivate = (existing || []).filter(
+    (row) => !kept.has(eventKey(row.title, row.start_date))
+  );
+
+  if (toDeactivate.length === 0) return 0;
+
+  const { error: updateError } = await supabase
+    .from('agent_events')
+    .update({ active: false })
+    .in(
+      'id',
+      toDeactivate.map((row) => row.id)
+    );
+
+  if (updateError) throw updateError;
+  return toDeactivate.length;
+}
+
+// Lee todas las filas de la hoja indicada en GOOGLE_SHEET_ID, hace upsert
+// en agent_events (conflicto por agent_id+title+start_date) y desactiva
+// las filas activas del agente que ya no están en la hoja.
 async function syncAgentEvents(agentId) {
   const spreadsheetId = process.env.GOOGLE_SHEET_ID;
 
@@ -70,21 +107,24 @@ async function syncAgentEvents(agentId) {
   });
 
   const [headers, ...rows] = data.values || [];
-  if (!headers) return { synced: 0 };
+  // Sin cabeceras: no tocamos DB (posible fallo/hoja vacía inesperada).
+  if (!headers) return { synced: 0, deactivated: 0 };
 
   const events = rows
     .map((row) => rowToEvent(headers, row, agentId))
     .filter((event) => event.title);
 
-  if (events.length === 0) return { synced: 0 };
+  if (events.length > 0) {
+    const { error } = await supabase
+      .from('agent_events')
+      .upsert(events, { onConflict: 'agent_id,title,start_date' });
 
-  const { error } = await supabase
-    .from('agent_events')
-    .upsert(events, { onConflict: 'agent_id,title,start_date' });
+    if (error) throw error;
+  }
 
-  if (error) throw error;
+  const deactivated = await deactivateMissingEvents(agentId, events);
 
-  return { synced: events.length };
+  return { synced: events.length, deactivated };
 }
 
 module.exports = { syncAgentEvents };
