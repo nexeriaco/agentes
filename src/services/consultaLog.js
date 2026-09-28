@@ -82,9 +82,9 @@ function newConsultaLogId() {
   return Math.random().toString(36).slice(2, 8);
 }
 
-// Orden de campos (estable): barra → cabecera modo/fecha → Consulta →
-// Respuesta → Fuente → Lectura (page_cache/pdf) → Historial (conversation_history)
-// → (Fuente raw) → (Motivo) → Candidatas → Tokens → Coste → barra.
+// Orden de campos (estable): barra → cabecera modo/fecha → (Consulta/Respuesta
+// omitidas: no volcar texto del ciudadano ni la respuesta a logs — RGPD) →
+// Fuente → Lectura → Historial (conteo) → Motivo → Candidatas → Tokens → Coste.
 function logConsulta(payload) {
   const bar = '='.repeat(72);
   const thin = '-'.repeat(72);
@@ -95,9 +95,10 @@ function logConsulta(payload) {
     bar,
     `[consulta]  modo=${payload.modo}  |  ${payload.fecha}  |  id=${logId}`,
     thin,
-    `Consulta:   ${oneLine(payload.consulta)}`,
-    `Respuesta:  ${oneLine(payload.respuesta)}`,
-    thin,
+    // Consulta / Respuesta: no se registran (pueden contener datos personales).
+    // `Consulta:   ${oneLine(payload.consulta)}`,
+    // `Respuesta:  ${oneLine(payload.respuesta)}`,
+    // thin,
     `Fuente:     ${formatFuenteLine(payload.fuente)}`,
     `Lectura:    ${formatUrlReadsLine(payload.url_reads)}`,
   ];
