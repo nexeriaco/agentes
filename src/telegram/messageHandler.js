@@ -7,11 +7,9 @@ const { checkChatRateLimit } = require('../services/chatRateLimit');
 const { REFORMULATE_ANSWER } = require('../constants');
 const telegram = require('./client');
 
-// Aviso de apertura (/start): saludo + transparencia RGPD (borrador operativo;
-// el ayuntamiento, como responsable, puede sustituir el texto legal definitivo).
+// Al abrir el chat, Telegram envía /start; respuesta fija sin Claude.
 const WELCOME_MESSAGE =
-  '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información municipal que necesites.\n\n'
-  + 'Protección de datos: el responsable del tratamiento es el Ayuntamiento. Este chat sirve para información general, no para trámites que requieran identificarte. No envíes DNI, datos de salud ni información de otras personas. Se puede guardar un historial breve de la conversación solo para darte contexto. El servicio lo opera un encargado técnico (Nexeria) con proveedores de mensajería, hosting e IA. Para ejercer tus derechos (acceso, supresión, etc.), contacta con el Ayuntamiento por los canales oficiales.';
+  '¡Hola! Soy el asistente virtual del ayuntamiento. Escribe tu consulta y te ayudo con la información que necesites.';
 
 const MAX_MESSAGE_CHARS = 300;
 
