@@ -43,6 +43,76 @@ const BOT_CLARIFICATION_RE =
 const STANDALONE_QUESTION_RE =
   /^(¿?\s*)(cuál|cual|cuánto|cuanto|dónde|donde|cómo|como|qué|que|quién|quien|horario|teléfono|telefono|email|correo|precio|precios|cuánto\s+cuesta|cuanto\s+cuesta)\b/i;
 
+// Preguntas cortas que cambian el dato solicitado, pero mantienen la entidad
+// activa: "¿dónde está?", "¿cuál es el horario?", "¿y el teléfono?".
+const CONTEXT_ONLY_PREFIX_RE =
+  /^(¿?\s*(?:y\s+)?(?:dónde|donde|cómo|como|qué|que|cuál|cual|cuánto|cuanto|horario|teléfono|telefono|email|correo|dirección|direccion|número|numero)\b)/i;
+
+const TOPIC_STOPWORDS = new Set([
+  'contacto', 'correo', 'direccion', 'donde', 'email', 'el', 'en', 'horario',
+  'informacion', 'la', 'llamar', 'los', 'municipal', 'municipales', 'numero',
+  'para', 'por', 'que', 'servicio', 'servicios', 'telefono', 'teléfono',
+  'una', 'del', 'de', 'y',
+]);
+
+function normalizeTopicText(text) {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase();
+}
+
+function candidateTopicTokens(candidate) {
+  return normalizeTopicText(
+    `${candidate.case_group || ''} ${candidate.case_subgroup || ''}`
+  )
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 4 && !TOPIC_STOPWORDS.has(token));
+}
+
+function messageMentionsCandidate(message, candidate) {
+  const normalizedMessage = normalizeTopicText(message);
+  return candidateTopicTokens(candidate)
+    .some((token) => normalizedMessage.includes(token));
+}
+
+function isShortContextOnlyMessage(message) {
+  const text = String(message || '').trim();
+  if (!text || text.length > 42) return false;
+  return isLexicalFollowUp(text)
+    || CONTEXT_ONLY_PREFIX_RE.test(normalizeTopicText(text));
+}
+
+function getPendingOptionIndex(message) {
+  const text = normalizeTopicText(message).trim();
+  const match = text.match(
+    /^(?:el|la|opcion|opción)?\s*(primero|primera|segundo|segunda|tercero|tercera|1|2|3)\b/
+  );
+  if (!match) return null;
+
+  const value = match[1];
+  if (value === 'primero' || value === 'primera' || value === '1') return 0;
+  if (value === 'segundo' || value === 'segunda' || value === '2') return 1;
+  if (value === 'tercero' || value === 'tercera' || value === '3') return 2;
+  return null;
+}
+
+async function getInstructionById(agentId, instructionId) {
+  const { data, error } = await supabase
+    .from('agent_instructions')
+    .select(
+      'id, agent_id, case_group, instruction, associated_url, '
+        + 'allow_url_reading, active, case_subgroup, response_mode'
+    )
+    .eq('id', instructionId)
+    .eq('agent_id', agentId)
+    .eq('active', true)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data ? { ...data, similarity: 1 } : null;
+}
+
 // Dado un agentId y un texto de búsqueda ya resuelto, devuelve las
 // instrucciones activas de ese agente semánticamente más relevantes
 // (embedding del texto vs. embedding de cada instrucción, vía pgvector vía
@@ -157,6 +227,7 @@ async function getRelevantInstructions(agentId, citizenMessage, history = [], op
   const retrievalMeta = options.retrievalMeta || {};
   retrievalMeta.clarificationFollowUp = false;
   retrievalMeta.contextFollowUp = false;
+  retrievalMeta.stateFollowUp = false;
 
   const directMatches = options.directMatches !== undefined
     ? options.directMatches
@@ -165,6 +236,51 @@ async function getRelevantInstructions(agentId, citizenMessage, history = [], op
   const lastUserMessage = findLastByRole(history, 'user');
   const awaitingClarification = isAwaitingClarificationReply(history, citizenMessage);
   const lexicalFollowUp = isLexicalFollowUp(citizenMessage);
+  const conversationState = options.conversationState;
+
+  // Si el ciudadano está eligiendo una opción de una aclaración anterior,
+  // resolver por ID evita que "el segundo" dependa de un embedding ambiguo.
+  const pendingOptionIndex = conversationState
+    && Array.isArray(conversationState.pending_options)
+    ? getPendingOptionIndex(citizenMessage)
+    : null;
+  if (
+    pendingOptionIndex != null
+    && conversationState.pending_options[pendingOptionIndex]
+  ) {
+    const option = conversationState.pending_options[pendingOptionIndex];
+    if (option.source_kind === 'instruction' && option.source_id) {
+      const selected = await getInstructionById(agentId, option.source_id);
+      if (selected) {
+        retrievalMeta.contextFollowUp = true;
+        retrievalMeta.clarificationFollowUp = true;
+        retrievalMeta.stateFollowUp = true;
+        return [selected];
+      }
+    }
+  }
+
+  // La entidad guardada es "pegajosa" y el dato solicitado es intercambiable:
+  // "horario del Ecoparque" + "¿y el teléfono?" se convierte en una búsqueda
+  // canónica que contiene ambos contextos. Si el mensaje nombra otra entidad,
+  // se respeta la búsqueda directa y se cambia de tema.
+  const stateFollowUp = conversationState
+    && conversationState.context_text
+    && (awaitingClarification || isShortContextOnlyMessage(citizenMessage))
+    && !directMatches.some((candidate) =>
+      messageMentionsCandidate(citizenMessage, candidate));
+  if (stateFollowUp) {
+    const stateMatches = await matchInstructions(
+      agentId,
+      `${conversationState.context_text}\n${citizenMessage}`
+    );
+    if (stateMatches.length > 0) {
+      retrievalMeta.contextFollowUp = true;
+      retrievalMeta.clarificationFollowUp = awaitingClarification;
+      retrievalMeta.stateFollowUp = true;
+      return stateMatches;
+    }
+  }
 
   // Resolver el contexto antes de aceptar una coincidencia directa cuando el
   // mensaje parece un seguimiento. Así "¿y el teléfono?" conserva el asunto
@@ -208,5 +324,6 @@ module.exports = {
   getRelevantInstructions,
   matchInstructions,
   isAwaitingClarificationReply,
+  isLexicalFollowUp,
   looksLikeBotClarification,
 };

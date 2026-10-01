@@ -3,6 +3,10 @@ const { generateAnswer } = require('../services/answer');
 const { logConsulta, emptyUsage, hashChatId } = require('../services/consultaLog');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('../services/politeClosing');
 const { appendTurn } = require('../services/conversationHistory');
+const {
+  clearConversationState,
+  saveConversationState,
+} = require('../services/conversationState');
 const { checkChatRateLimit } = require('../services/chatRateLimit');
 const { REFORMULATE_ANSWER } = require('../constants');
 const telegram = require('./client');
@@ -56,10 +60,15 @@ async function handleIncomingMessage(chatId, text) {
         return;
       }
 
+      await clearConversationState(routing.agentId, chatId).catch((err) =>
+        console.error('Error limpiando estado conversacional:', err)
+      );
+
       logConsulta({
         chat_hash: hashChatId(chatId),
         context_follow_up: false,
         clarification_follow_up: false,
+        state_follow_up: false,
         elapsed_ms: Date.now() - startedAt,
         fecha: new Date().toISOString(),
         modo: 'fijo',
@@ -96,6 +105,7 @@ async function handleIncomingMessage(chatId, text) {
         chat_hash: hashChatId(chatId),
         context_follow_up: false,
         clarification_follow_up: false,
+        state_follow_up: false,
         elapsed_ms: Date.now() - startedAt,
         fecha: new Date().toISOString(),
         modo: 'cierre',
@@ -114,6 +124,9 @@ async function handleIncomingMessage(chatId, text) {
         await appendTurn(routing.agentId, chatId, trimmed, POLITE_CLOSING_ANSWER).catch((err) =>
           console.error('Error guardando historial de conversación:', err)
         );
+        await clearConversationState(routing.agentId, chatId).catch((err) =>
+          console.error('Error limpiando estado conversacional:', err)
+        );
       }
       return;
     }
@@ -127,7 +140,7 @@ async function handleIncomingMessage(chatId, text) {
         return;
       }
 
-      const { answer } = await generateAnswer(
+      const { answer, conversationState } = await generateAnswer(
         trimmed,
         routing.agentId,
         chatId
@@ -142,6 +155,16 @@ async function handleIncomingMessage(chatId, text) {
       await appendTurn(routing.agentId, chatId, trimmed, finalText).catch((err) =>
         console.error('Error guardando historial de conversación:', err)
       );
+      if (conversationState) {
+        await saveConversationState(
+          routing.agentId,
+          chatId,
+          conversationState
+        ).catch((err) => console.error(
+          'Error guardando estado conversacional:',
+          err
+        ));
+      }
     } finally {
       stopTyping();
     }

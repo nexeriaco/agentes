@@ -124,10 +124,15 @@ function logConsulta(payload) {
     lines.push(`Historial:  ${historialLine}`);
   }
 
-  if (payload.context_follow_up != null || payload.clarification_follow_up != null) {
+  if (
+    payload.context_follow_up != null
+    || payload.clarification_follow_up != null
+    || payload.state_follow_up != null
+  ) {
     lines.push(
       `Seguimiento: contexto=${payload.context_follow_up ? 'sí' : 'no'}`
         + ` | aclaracion=${payload.clarification_follow_up ? 'sí' : 'no'}`
+        + ` | estado=${payload.state_follow_up ? 'sí' : 'no'}`
     );
   }
 

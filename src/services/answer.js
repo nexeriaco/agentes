@@ -7,6 +7,12 @@ const { BUSCAR_URL_TOOL } = require('../anthropic/tools');
 const { buscarUrlConCache, tryServeFromCacheOnly } = require('./urlCache');
 const { buildReadableUrlPolicy, isUrlAllowedByPolicy } = require('./urlGuard');
 const { getRecentHistory } = require('./conversationHistory');
+const {
+  buildConversationState,
+  emptyConversationState,
+  getConversationState,
+  mergePendingOptions,
+} = require('./conversationState');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('./politeClosing');
 const { pickBestDirecto } = require('./directoShortcut');
 const {
@@ -153,6 +159,28 @@ function buildCandidateClarification(nearMatches = []) {
   return `¿Te refieres a ${labels[0]}, ${labels[1]} o ${labels[2]}?`;
 }
 
+function buildPendingOptions(nearMatches = []) {
+  const options = [];
+  const labels = new Set();
+  for (const candidate of nearMatches) {
+    if (
+      !candidate
+      || !candidate.id
+      || candidate.similarity < CANDIDATE_CLARIFICATION_THRESHOLD
+    ) continue;
+    const label = candidateLabel(candidate);
+    if (!label || labels.has(label)) continue;
+    labels.add(label);
+    options.push({
+      source_kind: 'instruction',
+      source_id: String(candidate.id),
+      label,
+    });
+    if (options.length === 3) break;
+  }
+  return options;
+}
+
 // Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
 // enrutamiento y el chatId de la conversación (para recuperar su
 // historial reciente), y genera la respuesta usando las instrucciones
@@ -167,6 +195,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     chat_hash: hashChatId(chatId),
     context_follow_up: Boolean(retrievalMeta.contextFollowUp),
     clarification_follow_up: Boolean(retrievalMeta.clarificationFollowUp),
+    state_follow_up: Boolean(retrievalMeta.stateFollowUp),
     elapsed_ms: Date.now() - startedAt,
   });
 
@@ -188,18 +217,26 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const [agent, events, history, directMatches, escalationContacts] = await Promise.all([
+  const [
+    agent,
+    events,
+    history,
+    directMatches,
+    escalationContacts,
+    conversationState,
+  ] = await Promise.all([
     getAgent(agentId),
     getRelevantEvents(agentId, today),
     getRecentHistory(agentId, chatId),
     matchInstructions(agentId, citizenMessage, { retrievalMeta }),
     getEscalationContacts(agentId),
+    getConversationState(agentId, chatId),
   ]);
   const instructions = await getRelevantInstructions(
     agentId,
     citizenMessage,
     history,
-    { directMatches, retrievalMeta }
+    { directMatches, retrievalMeta, conversationState }
   );
 
   if (!agent) {
@@ -217,12 +254,18 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       motivo: 'agente_inactivo_o_inexistente',
       historial_msgs: history.length,
     });
-    return { answer: REFORMULATE_ANSWER };
+    return {
+      answer: REFORMULATE_ANSWER,
+      conversationState: emptyConversationState(),
+    };
   }
 
   if (instructions.length === 0 && events.length === 0) {
     const clarification = buildCandidateClarification(retrievalMeta.nearMatches);
     const fallbackAnswer = clarification || REFORMULATE_ANSWER;
+    const pendingOptions = clarification
+      ? buildPendingOptions(retrievalMeta.nearMatches)
+      : [];
 
     logConsulta({
       ...traceFields(),
@@ -238,7 +281,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       motivo: clarification ? 'candidatas_cercanas' : 'sin_instrucciones_ni_eventos',
       historial_msgs: history.length,
     });
-    return { answer: fallbackAnswer };
+    return {
+      answer: fallbackAnswer,
+      conversationState: clarification
+        ? mergePendingOptions(conversationState, pendingOptions)
+        : emptyConversationState(),
+    };
   }
 
   // Atajo 'directo': FAQs claras sin Claude. En CONTACTO exige que la
@@ -264,7 +312,13 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       modelo: null,
       historial_msgs: history.length,
     });
-    return { answer: bestDirecto.instruction };
+    return {
+      answer: bestDirecto.instruction,
+      conversationState: buildConversationState(
+        summarizeInstruction(bestDirecto),
+        citizenMessage
+      ),
+    };
   }
 
   // Bloque fijo (tono, reglas, estilo, tarea, eventos del día) con
@@ -278,8 +332,11 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   let prefetchQuery = citizenMessage;
   if (retrievalMeta.contextFollowUp) {
     const prevUser = [...history].reverse().find((m) => m.role === 'user');
-    if (prevUser && prevUser.content) {
-      prefetchQuery = `${prevUser.content}\n${citizenMessage}`;
+    const previousContext = retrievalMeta.stateFollowUp
+      ? conversationState && conversationState.context_text
+      : prevUser && prevUser.content;
+    if (previousContext) {
+      prefetchQuery = `${previousContext}\n${citizenMessage}`;
     }
   }
   const prefetched = await prefetchReadableDocs(agentId, associatedUrls, prefetchQuery);
@@ -393,7 +450,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       motivo: 'sentinel_reformular',
       historial_msgs: history.length,
     });
-    return { answer: REFORMULATE_ANSWER };
+    return {
+      answer: REFORMULATE_ANSWER,
+      conversationState: fuente
+        ? buildConversationState(fuente, citizenMessage)
+        : emptyConversationState(),
+    };
   }
 
   logConsulta({
@@ -413,7 +475,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     historial_msgs: history.length,
   });
 
-  return { answer };
+  return {
+    answer,
+    conversationState: fuente
+      ? buildConversationState(fuente, citizenMessage)
+      : emptyConversationState(),
+  };
 }
 
 module.exports = { generateAnswer };
