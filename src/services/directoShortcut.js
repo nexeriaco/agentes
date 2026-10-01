@@ -2,6 +2,7 @@
 // La preferencia por entidad de teléfono vive en contactDirecto.js.
 
 const { applyContactEntityPreference, isContactPhoneRow } = require('./contactDirecto');
+const { isPhoneOnlyRequest } = require('./followUp');
 
 // Similitud mínima para responder sin Claude (filas response_mode='directo').
 const DIRECT_RESPONSE_THRESHOLD = 0.55;
@@ -37,8 +38,35 @@ function isAmbiguousDirectoCluster(directoPool) {
   return (sorted[0].similarity - sorted[1].similarity) < DIRECTO_AMBIGUITY_GAP;
 }
 
+// Seguimiento sobre un tema ya activo ("¿y su teléfono?" tras hablar de un
+// centro). La entidad la fija la ficha de la respuesta anterior (sourceId),
+// no la similitud: así nunca se atajan teléfonos de otra entidad aunque la
+// búsqueda enriquecida traiga varias fichas CONTACTO parecidas.
+// Solo se ataja si la ficha activa es CONTACTO, está entre las recuperadas y
+// el mensaje pide únicamente el teléfono; cualquier otro caso pasa a IA.
+function pickFollowUpDirecto(instructions, citizenMessage, followUp) {
+  if (!followUp.sourceId || !isPhoneOnlyRequest(citizenMessage)) return null;
+
+  const activeRow = instructions.find(
+    (instr) => String(instr.id) === String(followUp.sourceId)
+  );
+  if (!activeRow
+    || activeRow.response_mode !== 'directo'
+    || !isContactPhoneRow(activeRow)
+    || activeRow.similarity < DIRECT_RESPONSE_THRESHOLD) {
+    return null;
+  }
+  return { instr: activeRow, reason: 'follow_up_entity' };
+}
+
 // Elige la ficha 'directo' a devolver, o null para pasar a IA.
-function pickBestDirecto(instructions, citizenMessage) {
+// options.followUp = { sourceId } activa el modo seguimiento (ver arriba); sin
+// él, se aplica la lógica general por similitud.
+function pickBestDirecto(instructions, citizenMessage, options = {}) {
+  if (options.followUp) {
+    return pickFollowUpDirecto(instructions, citizenMessage, options.followUp);
+  }
+
   if (instructions.length === 1
     && instructions[0].response_mode === 'directo'
     && canUseDirecto(instructions[0], citizenMessage)) {

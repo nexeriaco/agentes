@@ -75,18 +75,6 @@ function buildConversationState(source, citizenMessage, pendingOptions = []) {
   };
 }
 
-function mergePendingOptions(state, pendingOptions) {
-  if (!state && pendingOptions.length === 0) return null;
-  return {
-    source_kind: state ? state.source_kind : null,
-    source_id: state ? state.source_id : null,
-    entity_label: state ? state.entity_label : null,
-    context_text: state ? state.context_text : null,
-    intent: state ? state.intent : null,
-    pending_options: pendingOptions,
-  };
-}
-
 function emptyConversationState() {
   return {
     source_kind: null,
@@ -96,6 +84,42 @@ function emptyConversationState() {
     intent: null,
     pending_options: [],
   };
+}
+
+// Estado tras una aclaración del bot ("¿Te refieres a A o a B?"): solo quedan
+// las opciones. La ficha anterior se descarta a propósito: la aclaración
+// existe porque el tema NO está resuelto, y conservarla haría que la
+// respuesta del ciudadano se enriqueciera con un tema que ya no es el activo.
+function pendingOptionsState(pendingOptions) {
+  if (!pendingOptions || pendingOptions.length === 0) return emptyConversationState();
+  return { ...emptyConversationState(), pending_options: pendingOptions };
+}
+
+// ¿La fuente de la respuesta permite describir un tema? Claude puede citar un
+// id que no está entre las fichas del turno (summarizeInstruction no se pudo
+// rellenar): sin título no hay contexto que guardar.
+function hasResolvableSource(source) {
+  if (!source) return false;
+  if (source.tabla === 'agent_events') return Boolean(source.title);
+  return Boolean(source.case_group || source.case_subgroup);
+}
+
+// Estado que debe quedar guardado tras responder.
+// - Hay fuente identificada → ese es el tema activo.
+// - No hay fuente (aclaración de Claude, doc_miss, reformular...) pero el
+//   mensaje continuaba el tema activo → el tema sigue vivo: se conserva (y se
+//   renueva su TTL al guardarlo). Así "teléfono" → "no aparece en el
+//   documento" → "¿y el horario?" no pierde de qué hablábamos.
+// - No hay fuente y el mensaje abría un tema nuevo sin resolver → se limpia,
+//   para que un seguimiento posterior no se pegue a un tema anterior ajeno.
+function resolveNextState({ source, citizenMessage, previousState, wasFollowUp }) {
+  if (hasResolvableSource(source)) {
+    return buildConversationState(source, citizenMessage);
+  }
+  if (wasFollowUp && previousState && previousState.context_text) {
+    return { ...previousState, pending_options: [] };
+  }
+  return emptyConversationState();
 }
 
 function normalizeStateRow(row) {
@@ -137,6 +161,16 @@ async function getConversationState(agentId, chatId) {
   return age > STATE_TTL_MS ? null : state;
 }
 
+// La columna source_id es uuid: si un id de otra tabla (p. ej. un evento con
+// id numérico) no lo es, el upsert entero fallaría y se perdería también el
+// contexto. Se guarda sin id y se conserva el resto.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function toUuidOrNull(value) {
+  const text = value == null ? '' : String(value);
+  return UUID_RE.test(text) ? text : null;
+}
+
 async function saveConversationState(agentId, chatId, state) {
   if (chatId == null || !state) return;
 
@@ -144,7 +178,7 @@ async function saveConversationState(agentId, chatId, state) {
     agent_id: agentId,
     chat_id: String(chatId),
     source_kind: state.source_kind || null,
-    source_id: state.source_id || null,
+    source_id: toUuidOrNull(state.source_id),
     entity_label: state.entity_label || null,
     context_text: state.context_text || null,
     intent: state.intent || null,
@@ -179,6 +213,7 @@ module.exports = {
   clearConversationState,
   emptyConversationState,
   getConversationState,
-  mergePendingOptions,
+  pendingOptionsState,
+  resolveNextState,
   saveConversationState,
 };

@@ -11,7 +11,8 @@ const {
   buildConversationState,
   emptyConversationState,
   getConversationState,
-  mergePendingOptions,
+  pendingOptionsState,
+  resolveNextState,
 } = require('./conversationState');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('./politeClosing');
 const { pickBestDirecto } = require('./directoShortcut');
@@ -198,6 +199,11 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     state_follow_up: Boolean(retrievalMeta.stateFollowUp),
     elapsed_ms: Date.now() - startedAt,
   });
+  // ¿El mensaje continuaba un tema activo? (aunque no se hayan encontrado
+  // fichas): decide si un turno sin fuente conserva o limpia el estado.
+  const wasFollowUp = () => Boolean(
+    retrievalMeta.contextFollowUp || retrievalMeta.stateFollowUpDetected
+  );
 
   if (isPoliteClosingMessage(citizenMessage)) {
     logConsulta({
@@ -284,8 +290,13 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     return {
       answer: fallbackAnswer,
       conversationState: clarification
-        ? mergePendingOptions(conversationState, pendingOptions)
-        : emptyConversationState(),
+        ? pendingOptionsState(pendingOptions)
+        : resolveNextState({
+          source: null,
+          citizenMessage,
+          previousState: conversationState,
+          wasFollowUp: wasFollowUp(),
+        }),
     };
   }
 
@@ -293,9 +304,21 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   // consulta nombre la entidad (evita Polideportivo con "ayuntamiento").
   // Tras una aclaración del bot, no atajar: la respuesta corta del ciudadano
   // ("escuelas infantiles") no debe caer en un CONTACTO suelto.
-  const picked = retrievalMeta.contextFollowUp
-    ? null
-    : pickBestDirecto(instructions, citizenMessage);
+  // Seguimiento sobre un tema activo ("¿y su teléfono?"): se ataja solo si la
+  // ficha activa (la de la respuesta anterior) es el CONTACTO pedido; la
+  // entidad la fija el estado, no la similitud (ver pickFollowUpDirecto).
+  const stateFollowUpShortcut = retrievalMeta.stateFollowUp
+    && !retrievalMeta.clarificationFollowUp
+    && conversationState
+    && conversationState.source_id;
+  let picked = null;
+  if (stateFollowUpShortcut) {
+    picked = pickBestDirecto(instructions, citizenMessage, {
+      followUp: { sourceId: conversationState.source_id },
+    });
+  } else if (!retrievalMeta.contextFollowUp) {
+    picked = pickBestDirecto(instructions, citizenMessage);
+  }
   const bestDirecto = picked && picked.instr;
 
   if (bestDirecto) {
@@ -310,6 +333,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
       tokens: emptyUsage(),
       coste_usd: 0,
       modelo: null,
+      motivo: `directo_${picked.reason}`,
       historial_msgs: history.length,
     });
     return {
@@ -452,9 +476,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     });
     return {
       answer: REFORMULATE_ANSWER,
-      conversationState: fuente
-        ? buildConversationState(fuente, citizenMessage)
-        : emptyConversationState(),
+      conversationState: resolveNextState({
+        source: fuente,
+        citizenMessage,
+        previousState: conversationState,
+        wasFollowUp: wasFollowUp(),
+      }),
     };
   }
 
@@ -477,9 +504,12 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   return {
     answer,
-    conversationState: fuente
-      ? buildConversationState(fuente, citizenMessage)
-      : emptyConversationState(),
+    conversationState: resolveNextState({
+      source: fuente,
+      citizenMessage,
+      previousState: conversationState,
+      wasFollowUp: wasFollowUp(),
+    }),
   };
 }
 
