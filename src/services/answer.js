@@ -121,13 +121,44 @@ async function prefetchReadableDocs(agentId, urls, query) {
   return results.filter(Boolean);
 }
 
+// Por debajo del hueco observado frente a consultas sin relación (~0.35),
+// no mostramos categorías que podrían ser ruido.
+const CANDIDATE_CLARIFICATION_THRESHOLD = 0.36;
+
+function candidateLabel(candidate) {
+  const group = String(candidate.case_group || '').trim();
+  const subgroup = String(candidate.case_subgroup || '').trim();
+  if (!group && !subgroup) return null;
+  if (!subgroup || subgroup === group) return group || subgroup;
+  return `${group}: ${subgroup}`;
+}
+
+function buildCandidateClarification(nearMatches = []) {
+  const labels = [];
+  for (const candidate of nearMatches) {
+    if (candidate.similarity < CANDIDATE_CLARIFICATION_THRESHOLD) continue;
+    const label = candidateLabel(candidate);
+    if (label && !labels.includes(label)) labels.push(label);
+    if (labels.length === 3) break;
+  }
+
+  if (labels.length === 0) return null;
+  if (labels.length === 1) {
+    return `¿Te refieres a ${labels[0]}? ¿Qué información necesitas?`;
+  }
+  if (labels.length === 2) {
+    return `¿Te refieres a ${labels[0]} o a ${labels[1]}?`;
+  }
+  return `¿Te refieres a ${labels[0]}, ${labels[1]} o ${labels[2]}?`;
+}
+
 // Recibe el mensaje de un ciudadano, el agentId ya resuelto por el
 // enrutamiento y el chatId de la conversación (para recuperar su
 // historial reciente), y genera la respuesta usando las instrucciones
 // generales, los eventos vigentes/próximos 90 días (con su estado ya
 // calculado) y la configuración (tono) de ese agente como contexto.
-// Si no hay agente, fichas/eventos o Claude marca el sentinel interno,
-// devuelve REFORMULATE_ANSWER (nunca deriva a humano / teléfono).
+// Si no hay agente, ni fichas/eventos/candidatas cercanas, o Claude marca el
+// sentinel interno, devuelve una respuesta controlada.
 async function generateAnswer(citizenMessage, agentId, chatId) {
   if (isPoliteClosingMessage(citizenMessage)) {
     logConsulta({
@@ -151,7 +182,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     getAgent(agentId),
     getRelevantEvents(agentId, today),
     getRecentHistory(agentId, chatId),
-    matchInstructions(agentId, citizenMessage),
+    matchInstructions(agentId, citizenMessage, { retrievalMeta }),
     getEscalationContacts(agentId),
   ]);
   const instructions = await getRelevantInstructions(
@@ -179,27 +210,30 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   }
 
   if (instructions.length === 0 && events.length === 0) {
+    const clarification = buildCandidateClarification(retrievalMeta.nearMatches);
+    const fallbackAnswer = clarification || REFORMULATE_ANSWER;
+
     logConsulta({
       fecha: new Date().toISOString(),
-      modo: 'reformular',
+      modo: clarification ? 'aclaracion' : 'reformular',
       consulta: citizenMessage,
-      respuesta: REFORMULATE_ANSWER,
+      respuesta: fallbackAnswer,
       fuente: null,
-      candidatas: [],
+      candidatas: summarizeCandidates(retrievalMeta.nearMatches || []),
       tokens: emptyUsage(),
       coste_usd: 0,
       modelo: null,
-      motivo: 'sin_instrucciones_ni_eventos',
+      motivo: clarification ? 'candidatas_cercanas' : 'sin_instrucciones_ni_eventos',
       historial_msgs: history.length,
     });
-    return { answer: REFORMULATE_ANSWER };
+    return { answer: fallbackAnswer };
   }
 
   // Atajo 'directo': FAQs claras sin Claude. En CONTACTO exige que la
   // consulta nombre la entidad (evita Polideportivo con "ayuntamiento").
   // Tras una aclaración del bot, no atajar: la respuesta corta del ciudadano
   // ("escuelas infantiles") no debe caer en un CONTACTO suelto.
-  const picked = retrievalMeta.clarificationFollowUp
+  const picked = retrievalMeta.contextFollowUp
     ? null
     : pickBestDirecto(instructions, citizenMessage);
   const bestDirecto = picked && picked.instr;
@@ -229,7 +263,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   const associatedUrls = collectAssociatedReadableUrls(instructions, events);
   // Rank de PDF: si venimos de aclaración, usar «pregunta previa + respuesta».
   let prefetchQuery = citizenMessage;
-  if (retrievalMeta.clarificationFollowUp) {
+  if (retrievalMeta.contextFollowUp) {
     const prevUser = [...history].reverse().find((m) => m.role === 'user');
     if (prevUser && prevUser.content) {
       prefetchQuery = `${prevUser.content}\n${citizenMessage}`;

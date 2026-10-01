@@ -6,14 +6,14 @@
 const VOYAGE_API_URL = 'https://api.voyageai.com/v1/embeddings';
 const VOYAGE_MODEL = 'voyage-4-lite';
 
-// Reintentos ante 429 (límite de peticiones de Voyage) y ante errores de red
-// transitorios (DNS, timeout de conexión...) con backoff — red de seguridad
-// tanto para el backfill masivo (ver scripts/generar_embeddings.js, que
-// además espacia sus propias peticiones a propósito) como para una consulta
-// suelta en producción.
-const MAX_RETRIES = 5;
-const DEFAULT_BACKOFF_MS = 21000;
-const NETWORK_RETRY_BACKOFF_MS = 3000;
+// Límites pensados para consultas interactivas: una caída puntual no debe
+// bloquear la conversación varios minutos. El backfill también puede usar
+// este cliente, pero sus scripts ya espaciaban las peticiones por separado.
+const MAX_RETRIES = 2;
+const DEFAULT_BACKOFF_MS = 1000;
+const NETWORK_RETRY_BACKOFF_MS = 750;
+const MAX_RETRY_DELAY_MS = 4000;
+const REQUEST_TIMEOUT_MS = 8000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,6 +21,16 @@ function sleep(ms) {
 
 function buildInstructionText({ case_group, case_subgroup, instruction }) {
   return `Concejalía: ${case_group}. Subtema: ${case_subgroup}. ${instruction}`;
+}
+
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // input_type: 'document' para texto que se indexa (las instrucciones),
@@ -34,7 +44,7 @@ async function embed(texts, inputType) {
   for (let attempt = 0; ; attempt += 1) {
     let response;
     try {
-      response = await fetch(VOYAGE_API_URL, {
+      response = await fetchWithTimeout(VOYAGE_API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -64,9 +74,10 @@ async function embed(texts, inputType) {
     const body = await response.text();
     if (response.status === 429 && attempt < MAX_RETRIES) {
       const retryAfterHeader = Number(response.headers.get('retry-after'));
-      const backoffMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+      const requestedBackoffMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
         ? retryAfterHeader * 1000
         : DEFAULT_BACKOFF_MS * (attempt + 1);
+      const backoffMs = Math.min(requestedBackoffMs, MAX_RETRY_DELAY_MS);
       await sleep(backoffMs);
       continue;
     }

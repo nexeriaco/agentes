@@ -30,6 +30,11 @@ const CLARIFICATION_TOPIC_ESCAPE_GAP = 0.08;
 const FOLLOWUP_PREFIX =
   /^(¿?\s*y\b|sí\b|si\b|ok\b|vale\b|ese\b|esa\b|eso\b|esos\b|esas\b|el\s+primero|el\s+segundo|la\s+primera|la\s+segunda|más\s+info|más\s+detalles|y\s+eso|también\b|entonces\b|pero\b|sobre\s+eso|de\s+eso|lo\s+mismo)/i;
 
+// Seguimientos elípticos frecuentes que empiezan directamente por el dato
+// pedido: "el teléfono", "la dirección", "otro horario"...
+const SHORT_FOLLOWUP_PREFIX =
+  /^(¿?\s*(el|la|los|las|un|una|otro|otra|teléfono|telefono|correo|email|dirección|direccion)\b)/i;
+
 // Último mensaje del bot parece una aclaración (FUENTE ya no está en historial).
 const BOT_CLARIFICATION_RE =
   /¿[^?\n]{3,220}\?|\?\s*$|te refieres|necesitas.{0,80}\bo\b|a otro|o a |cuál de|cual de|¿a o b\b/i;
@@ -46,7 +51,7 @@ const STANDALONE_QUESTION_RE =
 // umbral, devuelve un array vacío: quien construya el prompt debe tratarlo
 // como "no hay información suficiente", no como "no hay instrucciones para
 // este agente".
-async function matchInstructions(agentId, queryText) {
+async function matchInstructions(agentId, queryText, options = {}) {
   const queryEmbedding = await embedQuery(queryText);
 
   const { data, error } = await supabase.rpc('match_agent_instructions', {
@@ -57,13 +62,18 @@ async function matchInstructions(agentId, queryText) {
 
   if (error) throw error;
 
+  if (options.retrievalMeta) {
+    options.retrievalMeta.nearMatches = data.slice(0, MATCH_COUNT);
+  }
+
   return data.filter((row) => row.similarity >= SIMILARITY_THRESHOLD);
 }
 
 function isLexicalFollowUp(message) {
   const text = String(message || '').trim();
   if (!text) return false;
-  return FOLLOWUP_PREFIX.test(text);
+  if (FOLLOWUP_PREFIX.test(text)) return true;
+  return text.length <= 42 && SHORT_FOLLOWUP_PREFIX.test(text);
 }
 
 function cosineSimilarity(a, b) {
@@ -131,12 +141,12 @@ async function isSameTopicAsPreviousUser(citizenMessage, previousUserMessage) {
 // Dado un agentId, el mensaje del ciudadano y (opcionalmente) el historial
 // reciente de la conversación, devuelve las instrucciones más relevantes.
 //
-// 0. Si el bot acaba de pedir aclaración y el ciudadano responde corto:
-//    buscar con «último USER + mensaje actual» (salvo escape por tema nuevo).
-//    options.retrievalMeta.clarificationFollowUp = true si se aplica.
-// 1. Siempre buscar solo con el mensaje actual. Si hay matches >= umbral,
-//    usarlos (tema autocontenido; no mezclar historial) — salvo paso 0.
-// 2. Si el match directo está vacío, enriquecer SOLO si parece follow-up:
+// 0. Si parece un seguimiento, o el bot acaba de pedir aclaración, buscar
+//    primero con «último USER + mensaje actual» (salvo escape por tema nuevo).
+//    options.retrievalMeta.contextFollowUp = true si se aplica.
+// 1. Si el mensaje es autocontenido, usar sus matches directos sin mezclar
+//    historial.
+// 2. Si no hay match directo, enriquecer SOLO si parece follow-up:
 //    - cue léxico ("¿y el teléfono?", "sí", "ese", "el segundo"…), o
 //    - mismo tema que el último mensaje del ciudadano (sim embedding >=
 //      TOPIC_CONTINUITY_THRESHOLD).
@@ -146,14 +156,20 @@ async function isSameTopicAsPreviousUser(citizenMessage, previousUserMessage) {
 async function getRelevantInstructions(agentId, citizenMessage, history = [], options = {}) {
   const retrievalMeta = options.retrievalMeta || {};
   retrievalMeta.clarificationFollowUp = false;
+  retrievalMeta.contextFollowUp = false;
 
   const directMatches = options.directMatches !== undefined
     ? options.directMatches
     : await matchInstructions(agentId, citizenMessage);
 
   const lastUserMessage = findLastByRole(history, 'user');
+  const awaitingClarification = isAwaitingClarificationReply(history, citizenMessage);
+  const lexicalFollowUp = isLexicalFollowUp(citizenMessage);
 
-  if (isAwaitingClarificationReply(history, citizenMessage) && lastUserMessage) {
+  // Resolver el contexto antes de aceptar una coincidencia directa cuando el
+  // mensaje parece un seguimiento. Así "¿y el teléfono?" conserva el asunto
+  // anterior, aunque exista una ficha CONTACTO genérica con match propio.
+  if ((awaitingClarification || lexicalFollowUp) && lastUserMessage) {
     const enrichedMatches = await matchInstructions(
       agentId,
       `${lastUserMessage.content}\n${citizenMessage}`
@@ -161,7 +177,8 @@ async function getRelevantInstructions(agentId, citizenMessage, history = [], op
 
     if (!shouldPreferAloneOverEnriched(directMatches, enrichedMatches)) {
       if (enrichedMatches.length > 0) {
-        retrievalMeta.clarificationFollowUp = true;
+        retrievalMeta.contextFollowUp = true;
+        retrievalMeta.clarificationFollowUp = awaitingClarification;
         return enrichedMatches;
       }
     }
@@ -172,7 +189,7 @@ async function getRelevantInstructions(agentId, citizenMessage, history = [], op
 
   if (!lastUserMessage) return directMatches;
 
-  let enrichWithPreviousUser = isLexicalFollowUp(citizenMessage);
+  let enrichWithPreviousUser = lexicalFollowUp;
   if (!enrichWithPreviousUser) {
     enrichWithPreviousUser = await isSameTopicAsPreviousUser(
       citizenMessage,

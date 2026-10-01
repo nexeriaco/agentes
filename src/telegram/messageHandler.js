@@ -28,6 +28,20 @@ function isTelegramOpenChat(text) {
   return TELEGRAM_OPEN_CHAT_RE.test((text || '').trim());
 }
 
+const TYPING_REFRESH_MS = 4_000;
+
+function startTyping(chatId) {
+  const sendTyping = () => {
+    telegram.sendChatAction(chatId, 'typing').catch((err) => {
+      console.warn('No se pudo actualizar el estado typing de Telegram:', err.message);
+    });
+  };
+
+  sendTyping();
+  const interval = setInterval(sendTyping, TYPING_REFRESH_MS);
+  return () => clearInterval(interval);
+}
+
 async function handleIncomingMessage(chatId, text) {
   try {
     const trimmed = (text || '').trim();
@@ -95,28 +109,33 @@ async function handleIncomingMessage(chatId, text) {
       return;
     }
 
-    const routing = await getTelegramRouting(telegram.getBotId());
-    if (!routing) {
-      console.error('No se encontró una ruta activa para este bot de Telegram');
-      await telegram.sendMessage(chatId, REFORMULATE_ANSWER);
-      return;
+    const stopTyping = startTyping(chatId);
+    try {
+      const routing = await getTelegramRouting(telegram.getBotId());
+      if (!routing) {
+        console.error('No se encontró una ruta activa para este bot de Telegram');
+        await telegram.sendMessage(chatId, REFORMULATE_ANSWER);
+        return;
+      }
+
+      const { answer } = await generateAnswer(
+        trimmed,
+        routing.agentId,
+        chatId
+      );
+      const finalText = answer || REFORMULATE_ANSWER;
+
+      await telegram.sendMessage(chatId, finalText);
+
+      // El guardado del historial no debe romper la respuesta ya enviada:
+      // si Supabase falla aquí, se pierde memoria de este turno pero el
+      // ciudadano ya recibió su respuesta con normalidad.
+      await appendTurn(routing.agentId, chatId, trimmed, finalText).catch((err) =>
+        console.error('Error guardando historial de conversación:', err)
+      );
+    } finally {
+      stopTyping();
     }
-
-    const { answer } = await generateAnswer(
-      trimmed,
-      routing.agentId,
-      chatId
-    );
-    const finalText = answer || REFORMULATE_ANSWER;
-
-    await telegram.sendMessage(chatId, finalText);
-
-    // El guardado del historial no debe romper la respuesta ya enviada:
-    // si Supabase falla aquí, se pierde memoria de este turno pero el
-    // ciudadano ya recibió su respuesta con normalidad.
-    await appendTurn(routing.agentId, chatId, trimmed, finalText).catch((err) =>
-      console.error('Error guardando historial de conversación:', err)
-    );
   } catch (err) {
     console.error('Error procesando mensaje de Telegram:', err);
     await telegram.sendMessage(chatId, REFORMULATE_ANSWER).catch(() => {});

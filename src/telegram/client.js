@@ -1,4 +1,5 @@
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error('Falta la variable de entorno TELEGRAM_BOT_TOKEN');
@@ -10,14 +11,22 @@ function getBotId() {
   return process.env.TELEGRAM_BOT_TOKEN.split(':')[0];
 }
 
-async function callApi(method, params) {
+async function callApi(method, params, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   const url = `${TELEGRAM_API_BASE}/bot${process.env.TELEGRAM_BOT_TOKEN}/${method}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const data = await response.json();
   if (!data.ok) {
@@ -46,6 +55,13 @@ function sendMessage(chatId, text) {
   });
 }
 
+function sendChatAction(chatId, action = 'typing') {
+  return callApi('sendChatAction', {
+    chat_id: chatId,
+    action,
+  }, 5_000);
+}
+
 // Long polling requiere que no haya un webhook activo en el bot.
 function deleteWebhook() {
   return callApi('deleteWebhook', {});
@@ -54,7 +70,13 @@ function deleteWebhook() {
 // timeout activa long polling: la llamada espera hasta ese tiempo (en
 // segundos) a que haya updates antes de responder vacío.
 function getUpdates(offset, timeout = 30) {
-  return callApi('getUpdates', { offset, timeout });
+  return callApi('getUpdates', { offset, timeout }, (timeout + 10) * 1000);
 }
 
-module.exports = { getBotId, sendMessage, deleteWebhook, getUpdates };
+module.exports = {
+  getBotId,
+  sendMessage,
+  sendChatAction,
+  deleteWebhook,
+  getUpdates,
+};
