@@ -1,3 +1,5 @@
+const crypto = require('node:crypto');
+
 function emptyUsage() {
   return {
     input_tokens: 0,
@@ -82,9 +84,19 @@ function newConsultaLogId() {
   return Math.random().toString(36).slice(2, 8);
 }
 
+function hashChatId(chatId) {
+  if (chatId == null || String(chatId).trim() === '') return null;
+  return crypto
+    .createHash('sha256')
+    .update(String(chatId))
+    .digest('hex')
+    .slice(0, 12);
+}
+
 // Orden de campos (estable): barra → cabecera modo/fecha → (Consulta/Respuesta
 // omitidas: no volcar texto del ciudadano ni la respuesta a logs — RGPD) →
-// Fuente → Lectura → Historial (conteo) → Motivo → Candidatas → Tokens → Coste.
+// Fuente → Lectura → Historial (conteo) → seguimiento → Motivo → Candidatas →
+// Tokens → Coste.
 function logConsulta(payload) {
   const bar = '='.repeat(72);
   const thin = '-'.repeat(72);
@@ -103,9 +115,20 @@ function logConsulta(payload) {
     `Lectura:    ${formatUrlReadsLine(payload.url_reads)}`,
   ];
 
+  if (payload.chat_hash) {
+    lines.push(`Chat hash:  ${payload.chat_hash}`);
+  }
+
   const historialLine = formatHistorialLine(payload.historial_msgs);
   if (historialLine) {
     lines.push(`Historial:  ${historialLine}`);
+  }
+
+  if (payload.context_follow_up != null || payload.clarification_follow_up != null) {
+    lines.push(
+      `Seguimiento: contexto=${payload.context_follow_up ? 'sí' : 'no'}`
+        + ` | aclaracion=${payload.clarification_follow_up ? 'sí' : 'no'}`
+    );
   }
 
   if (payload.fuente_raw != null) {
@@ -128,6 +151,9 @@ function logConsulta(payload) {
       + `  |  modelo=${payload.modelo || '—'}`
       + (payload.tool_calls != null ? `  |  tools=${payload.tool_calls}` : '')
   );
+  if (payload.elapsed_ms != null) {
+    lines.push(`Tiempo:     ${payload.elapsed_ms} ms`);
+  }
   lines.push(bar);
 
   // Una sola escritura atómica; cada línea lleva el id por si el viewer parte el bloque.
@@ -139,5 +165,6 @@ module.exports = {
   summarizeInstruction,
   summarizeEvent,
   summarizeCandidates,
+  hashChatId,
   logConsulta,
 };

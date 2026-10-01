@@ -1,6 +1,6 @@
 const { getTelegramRouting } = require('../services/routing');
 const { generateAnswer } = require('../services/answer');
-const { logConsulta, emptyUsage } = require('../services/consultaLog');
+const { logConsulta, emptyUsage, hashChatId } = require('../services/consultaLog');
 const { isPoliteClosingMessage, POLITE_CLOSING_ANSWER } = require('../services/politeClosing');
 const { appendTurn } = require('../services/conversationHistory');
 const { checkChatRateLimit } = require('../services/chatRateLimit');
@@ -43,6 +43,7 @@ function startTyping(chatId) {
 }
 
 async function handleIncomingMessage(chatId, text) {
+  const startedAt = Date.now();
   try {
     const trimmed = (text || '').trim();
 
@@ -56,6 +57,10 @@ async function handleIncomingMessage(chatId, text) {
       }
 
       logConsulta({
+        chat_hash: hashChatId(chatId),
+        context_follow_up: false,
+        clarification_follow_up: false,
+        elapsed_ms: Date.now() - startedAt,
         fecha: new Date().toISOString(),
         modo: 'fijo',
         consulta: trimmed,
@@ -88,6 +93,10 @@ async function handleIncomingMessage(chatId, text) {
     // Cierre educado: tras rate limit, antes de routing / Claude (0 Voyage).
     if (isPoliteClosingMessage(trimmed)) {
       logConsulta({
+        chat_hash: hashChatId(chatId),
+        context_follow_up: false,
+        clarification_follow_up: false,
+        elapsed_ms: Date.now() - startedAt,
         fecha: new Date().toISOString(),
         modo: 'cierre',
         consulta: trimmed,

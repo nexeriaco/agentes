@@ -13,6 +13,7 @@ const {
   emptyUsage,
   summarizeInstruction,
   summarizeCandidates,
+  hashChatId,
   logConsulta,
 } = require('./consultaLog');
 const {
@@ -160,8 +161,18 @@ function buildCandidateClarification(nearMatches = []) {
 // Si no hay agente, ni fichas/eventos/candidatas cercanas, o Claude marca el
 // sentinel interno, devuelve una respuesta controlada.
 async function generateAnswer(citizenMessage, agentId, chatId) {
+  const startedAt = Date.now();
+  const retrievalMeta = {};
+  const traceFields = () => ({
+    chat_hash: hashChatId(chatId),
+    context_follow_up: Boolean(retrievalMeta.contextFollowUp),
+    clarification_follow_up: Boolean(retrievalMeta.clarificationFollowUp),
+    elapsed_ms: Date.now() - startedAt,
+  });
+
   if (isPoliteClosingMessage(citizenMessage)) {
     logConsulta({
+      ...traceFields(),
       fecha: new Date().toISOString(),
       modo: 'cierre',
       consulta: citizenMessage,
@@ -176,7 +187,6 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const retrievalMeta = {};
 
   const [agent, events, history, directMatches, escalationContacts] = await Promise.all([
     getAgent(agentId),
@@ -194,6 +204,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   if (!agent) {
     logConsulta({
+      ...traceFields(),
       fecha: new Date().toISOString(),
       modo: 'reformular',
       consulta: citizenMessage,
@@ -214,6 +225,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
     const fallbackAnswer = clarification || REFORMULATE_ANSWER;
 
     logConsulta({
+      ...traceFields(),
       fecha: new Date().toISOString(),
       modo: clarification ? 'aclaracion' : 'reformular',
       consulta: citizenMessage,
@@ -240,6 +252,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   if (bestDirecto) {
     logConsulta({
+      ...traceFields(),
       fecha: new Date().toISOString(),
       modo: 'directo',
       consulta: citizenMessage,
@@ -364,6 +377,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
 
   if (answerIsReformulateSentinel) {
     logConsulta({
+      ...traceFields(),
       fecha: new Date().toISOString(),
       modo: 'reformular',
       consulta: citizenMessage,
@@ -383,6 +397,7 @@ async function generateAnswer(citizenMessage, agentId, chatId) {
   }
 
   logConsulta({
+    ...traceFields(),
     fecha: new Date().toISOString(),
     modo: 'ia',
     consulta: citizenMessage,
