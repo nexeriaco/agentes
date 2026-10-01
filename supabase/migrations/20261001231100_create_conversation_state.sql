@@ -17,3 +17,7 @@ create index if not exists conversation_state_updated_at_idx
   on public.conversation_state (updated_at);
 
 alter table public.conversation_state enable row level security;
+
+grant select, insert, update, delete
+on table public.conversation_state
+to service_role;
